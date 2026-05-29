@@ -82,6 +82,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.miniapp_board import apply_board_action
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -579,6 +580,31 @@ _CORS_HEADERS = {
 }
 
 
+def _request_origin_matches_host(request: Any, origin: str) -> bool:
+    """Return true when a browser Origin is the same host as this request.
+
+    Browsers include an ``Origin`` header on same-origin POST requests. The API
+    server's CORS hard gate should reject cross-origin browsers by default, but
+    it must not block the miniapp's own same-origin ``fetch('/miniapp/api/...')``
+    calls when no cross-origin allowlist is configured. Cloudflare/tunnel setups
+    may terminate HTTPS before forwarding to aiohttp, so compare hostnames and
+    ports instead of requiring the forwarded scheme to match exactly.
+    """
+    if not origin or origin == "null":
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        origin_host = (parsed.netloc or "").lower()
+        request_host = (request.host or request.headers.get("Host", "") or "").lower()
+        return bool(origin_host and request_host and origin_host == request_host)
+    except Exception:
+        return False
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def cors_middleware(request, handler):
@@ -586,15 +612,16 @@ if AIOHTTP_AVAILABLE:
         adapter = request.app.get("api_server_adapter")
         origin = request.headers.get("Origin", "")
         cors_headers = None
+        same_origin = _request_origin_matches_host(request, origin)
         if adapter is not None:
-            if not adapter._origin_allowed(origin):
+            if not same_origin and not adapter._origin_allowed(origin):
                 return web.Response(status=403)
             cors_headers = adapter._cors_headers_for_origin(origin)
 
         if request.method == "OPTIONS":
-            if cors_headers is None:
+            if cors_headers is None and not same_origin:
                 return web.Response(status=403)
-            return web.Response(status=200, headers=cors_headers)
+            return web.Response(status=200, headers=cors_headers or {})
 
         response = await handler(request)
         if cors_headers is not None:
@@ -782,14 +809,40 @@ _SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
 }
 
+_MINIAPP_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' https://telegram.org; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "base-uri 'none'; "
+        "form-action 'none'; "
+        "frame-ancestors https://web.telegram.org https://*.telegram.org"
+    ),
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-XSS-Protection": "0",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+}
+
 
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def security_headers_middleware(request, handler):
         """Add security headers to all responses (including errors)."""
         response = await handler(request)
-        for k, v in _SECURITY_HEADERS.items():
-            response.headers.setdefault(k, v)
+        headers = _MINIAPP_SECURITY_HEADERS if request.path.startswith("/miniapp") else _SECURITY_HEADERS
+        if request.path.startswith("/miniapp"):
+            response.headers.pop("X-Frame-Options", None)
+        for k, v in headers.items():
+            if request.path.startswith("/miniapp"):
+                response.headers[k] = v
+            else:
+                response.headers.setdefault(k, v)
         return response
 else:
     security_headers_middleware = None  # type: ignore[assignment]
@@ -968,6 +1021,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(
             extra.get("model_routes"),
         )
+        self._miniapp_config: Dict[str, Any] = self._normalize_miniapp_config(extra.get("miniapp"))
+        self._miniapp_static_dir: Path = self._resolve_miniapp_static_dir(self._miniapp_config.get("static_dir"))
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1145,6 +1200,125 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return "hermes-agent"
+
+    @staticmethod
+    def _normalize_miniapp_config(value: Any) -> Dict[str, Any]:
+        """Return a small, browser-safe config object for the Telegram miniapp."""
+        raw = value if isinstance(value, dict) else {}
+        app_name = str(raw.get("app_name") or os.getenv("API_SERVER_MINIAPP_NAME") or "Hermes Board").strip()
+        if not app_name:
+            app_name = "Hermes Board"
+        accent = str(raw.get("accent") or "#7c3aed").strip() or "#7c3aed"
+        suggestions = raw.get("suggestions")
+        if not isinstance(suggestions, list):
+            suggestions = []
+        suggestions = [str(item)[:120] for item in suggestions if str(item).strip()][:8]
+        return {
+            "app_name": app_name,
+            "api_base": str(raw.get("api_base") or "/v1"),
+            "accent": accent,
+            "description": str(raw.get("description") or "A shared blank board for Aidyn and Hermes to shape ideas together."),
+            "suggestions": suggestions,
+            "board": {
+                "mode": "collaboration",
+                "surface": "infinite-canvas",
+                "background": "dotted-grid",
+            },
+            "endpoints": {
+                "runs": "/v1/runs",
+                "run_events": "/v1/runs/{run_id}/events",
+                "run_status": "/v1/runs/{run_id}",
+                "stop_run": "/v1/runs/{run_id}/stop",
+                "board": "/miniapp/api/board",
+            },
+            "telegram": {
+                "web_app_ready": True,
+                "uses_init_data": True,
+            },
+            "static_dir": raw.get("static_dir"),
+        }
+
+    @staticmethod
+    def _resolve_miniapp_static_dir(static_dir: Any = None) -> Path:
+        if static_dir:
+            return Path(str(static_dir)).expanduser().resolve()
+        return Path(__file__).resolve().parents[1] / "miniapp"
+
+    def _miniapp_public_config(self) -> Dict[str, Any]:
+        config = dict(self._miniapp_config)
+        config.pop("static_dir", None)
+        config["auth_required"] = bool(self._api_key)
+        config["model"] = self._model_name
+        return config
+
+    def _resolve_miniapp_file(self, relative_path: str) -> Optional[Path]:
+        root = self._miniapp_static_dir
+        try:
+            candidate = (root / relative_path).resolve()
+            candidate.relative_to(root)
+        except (OSError, ValueError):
+            return None
+        if not candidate.is_file():
+            return None
+        return candidate
+
+    def _register_miniapp_routes(self, app: "web.Application") -> None:
+        """Expose the lightweight Telegram WebApp shell next to the API server.
+
+        Static files live under ``gateway/miniapp`` by default, or can be
+        swapped via ``platforms.api_server.extra.miniapp.static_dir`` for quick
+        iteration without touching Python code.
+        """
+        app.router.add_get("/miniapp", self._handle_miniapp_index)
+        app.router.add_get("/miniapp/", self._handle_miniapp_index)
+        app.router.add_get("/miniapp/config.json", self._handle_miniapp_config)
+        app.router.add_get("/miniapp/api/board", self._handle_miniapp_board_get)
+        app.router.add_post("/miniapp/api/board", self._handle_miniapp_board_post)
+        app.router.add_get("/miniapp/assets/{path:.*}", self._handle_miniapp_asset)
+
+    async def _handle_miniapp_index(self, request: "web.Request") -> "web.Response":
+        index = self._resolve_miniapp_file("index.html")
+        if index is None:
+            return web.Response(text="Miniapp index.html not found", status=404)
+        return web.FileResponse(index, headers=_MINIAPP_SECURITY_HEADERS)
+
+    async def _handle_miniapp_config(self, request: "web.Request") -> "web.Response":
+        return web.json_response(self._miniapp_public_config(), headers=_MINIAPP_SECURITY_HEADERS)
+
+    async def _handle_miniapp_board_get(self, request: "web.Request") -> "web.Response":
+        """Return the shared Hermes/Aidyn board state for the WebApp."""
+        result = apply_board_action("get")
+        return web.json_response(result, headers=_MINIAPP_SECURITY_HEADERS)
+
+    async def _handle_miniapp_board_post(self, request: "web.Request") -> "web.Response":
+        """Apply a small board mutation from the WebApp or local tooling."""
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response(
+                {"success": False, "error": "Invalid JSON"},
+                status=400,
+                headers=_MINIAPP_SECURITY_HEADERS,
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"success": False, "error": "Request body must be an object"},
+                status=400,
+                headers=_MINIAPP_SECURITY_HEADERS,
+            )
+        action = str(payload.pop("action", "set"))
+        result = apply_board_action(action, **payload)
+        status = 200 if result.get("success") else 400
+        return web.json_response(result, status=status, headers=_MINIAPP_SECURITY_HEADERS)
+
+    async def _handle_miniapp_asset(self, request: "web.Request") -> "web.Response":
+        rel = request.match_info.get("path", "")
+        if not rel:
+            return web.Response(status=404)
+        asset = self._resolve_miniapp_file(f"assets/{rel}")
+        if asset is None:
+            return web.Response(status=404)
+        return web.FileResponse(asset, headers=_MINIAPP_SECURITY_HEADERS)
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -5406,6 +5580,7 @@ class APIServerAdapter(BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            self._register_miniapp_routes(self._app)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

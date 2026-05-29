@@ -265,6 +265,9 @@ youtube = [
   # Without this declaration uv sync omits the package and both skills fail
   # at first invocation with ModuleNotFoundError (issue #22243).
   "youtube-transcript-api==1.2.4",
+  # Required by tools/kazakh_youtube_subtitles_tool.py for downloading YouTube
+  # audio before sending it to the Alem Kazakh STT API.
+  "yt-dlp==2026.3.17",
 ]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 # starlette==1.0.1 pinned for CVE-2026-48710 (BadHost) — fastapi pulls Starlette
