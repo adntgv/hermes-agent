@@ -211,7 +211,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "google-auth-oauthlib==1.3.1",
         "google-auth-httplib2==0.3.1",
     ),
-    "skill.youtube": ("youtube-transcript-api==1.2.4",),
+    "skill.youtube": ("youtube-transcript-api==1.2.4", "yt-dlp==2026.3.17"),
 
     # ─── Tools ─────────────────────────────────────────────────────────────
     # ACP adapter (VS Code / Zed / JetBrains integration)

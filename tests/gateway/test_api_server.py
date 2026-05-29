@@ -616,6 +616,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    adapter._register_miniapp_routes(app)
     return app
 
 
@@ -863,6 +864,82 @@ class TestModelsEndpoint:
 # ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
 # ---------------------------------------------------------------------------
+
+
+class TestMiniappEndpoint:
+    @pytest.mark.asyncio
+    async def test_miniapp_index_serves_figma_like_board_shell(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/miniapp")
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/html")
+            csp = resp.headers["Content-Security-Policy"]
+            assert "style-src 'self'" in csp
+            assert "script-src 'self' https://telegram.org" in csp
+            assert "frame-ancestors https://web.telegram.org https://*.telegram.org" in csp
+            assert "X-Frame-Options" not in resp.headers
+            text = await resp.text()
+
+        assert "Hermes Board" in text
+        assert "telegram-web-app.js" in text
+        assert "/miniapp/config.json" in text
+        assert "collaboration-board" in text
+        assert "board-canvas" in text
+        assert "dotted-grid" in text
+        assert "/v1/runs" not in text
+        assert "Run Hermes" not in text
+
+    @pytest.mark.asyncio
+    async def test_miniapp_config_is_json_and_auth_free(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/miniapp/config.json")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["app_name"] == "Hermes Board"
+        assert data["api_base"] == "/v1"
+        assert data["endpoints"]["runs"] == "/v1/runs"
+        assert data["endpoints"]["board"] == "/miniapp/api/board"
+        assert data["telegram"]["web_app_ready"] is True
+        assert data["board"]["mode"] == "collaboration"
+
+    @pytest.mark.asyncio
+    async def test_miniapp_board_api_shares_canvas_state(self, adapter, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            created = await cli.post(
+                "/miniapp/api/board",
+                json={"action": "create", "type": "note", "text": "Hello Aidyn", "x": 12, "y": -4},
+            )
+            assert created.status == 200
+            created_data = await created.json()
+            item = created_data["board"]["items"][0]
+            assert item["text"] == "Hello Aidyn"
+            assert item["x"] == 12
+
+            fetched = await cli.get("/miniapp/api/board")
+            assert fetched.status == 200
+            fetched_data = await fetched.json()
+
+        assert fetched_data["board"]["revision"] == created_data["board"]["revision"]
+        assert fetched_data["board"]["items"][0]["id"] == item["id"]
+        assert (tmp_path / "gateway" / "miniapp_board.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_miniapp_can_serve_custom_static_dir(self, tmp_path):
+        custom = tmp_path / "miniapp"
+        custom.mkdir()
+        (custom / "index.html").write_text("<html>Custom Hermes Lab</html>", encoding="utf-8")
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"miniapp": {"static_dir": str(custom)}}))
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/miniapp")
+            assert resp.status == 200
+            assert await resp.text() == "<html>Custom Hermes Lab</html>"
 
 
 class TestCapabilitiesEndpoint:
@@ -3247,6 +3324,32 @@ class TestCORS:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/health", headers={"Origin": "http://evil.example"})
             assert resp.status == 403
+            assert resp.headers.get("Access-Control-Allow-Origin") is None
+
+    @pytest.mark.asyncio
+    async def test_same_origin_browser_request_allowed_without_cors(self, adapter):
+        """Same-origin miniapp/browser requests must not be blocked by CORS gating."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            origin = str(cli.make_url("/")).rstrip("/")
+            resp = await cli.get("/health", headers={"Origin": origin})
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") is None
+
+    @pytest.mark.asyncio
+    async def test_same_origin_options_allowed_without_cors(self, adapter):
+        """Same-origin OPTIONS should not fail just because cross-origin CORS is disabled."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            origin = str(cli.make_url("/")).rstrip("/")
+            resp = await cli.options(
+                "/v1/chat/completions",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "POST",
+                },
+            )
+            assert resp.status == 200
             assert resp.headers.get("Access-Control-Allow-Origin") is None
 
     @pytest.mark.asyncio

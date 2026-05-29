@@ -268,6 +268,7 @@ class SessionContext:
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
     shared_multi_user_session: bool = False
+    topic_context: str = ""
     
     # Session metadata
     session_key: str = ""
@@ -283,6 +284,7 @@ class SessionContext:
                 p.value: hc.to_dict() for p, hc in self.home_channels.items()
             },
             "shared_multi_user_session": self.shared_multi_user_session,
+            "topic_context": self.topic_context,
             "session_key": self.session_key,
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -428,6 +430,10 @@ def build_session_context_prompt(
             "Matrix room/thread only. Do not assume unresolved references are "
             "about other Matrix rooms or projects unless the user explicitly says so."
         )
+
+    if context.topic_context:
+        lines.append("")
+        lines.append(context.topic_context)
 
     # User identity.
     # In shared multi-user sessions (shared threads OR shared non-thread groups
@@ -2167,6 +2173,18 @@ def build_session_context(
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         ),
     )
+
+    if source.platform == Platform.TELEGRAM and source.chat_type != "dm" and source.thread_id:
+        try:
+            from .telegram_topics import TelegramTopicRegistry
+
+            context.topic_context = TelegramTopicRegistry().format_topic_context(
+                chat_id=str(source.chat_id),
+                thread_id=str(source.thread_id),
+                chat_name=source.chat_name,
+            )
+        except Exception:
+            logger.debug("Could not load Telegram topic context", exc_info=True)
     
     if session_entry:
         context.session_key = session_entry.session_key
