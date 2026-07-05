@@ -3611,10 +3611,110 @@ class GatewaySlashCommandsMixin:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
 
+    async def _handle_group_topic_command(self, event: MessageEvent) -> str:
+        """Handle lightweight /topic metadata commands for Telegram group/forum topics."""
+        source = event.source
+        if source.platform != Platform.TELEGRAM or source.chat_type == "dm" or not source.thread_id:
+            return t("gateway.topic.not_telegram_dm")
+
+        from gateway.telegram_topics import TelegramTopicRegistry
+
+        registry = TelegramTopicRegistry()
+        chat_id = str(source.chat_id or "")
+        thread_id = str(source.thread_id or "")
+        chat_title = source.chat_name
+        args = event.get_command_args().strip()
+        command = (event.text or "").strip().split(maxsplit=1)[0].lower()
+
+        if command == "/topics" or args.lower() in {"list", "ls"}:
+            topics = registry.list_topics(chat_id)
+            if not topics:
+                return "No known topics for this Telegram group yet."
+            lines = ["Known topics:"]
+            for topic in topics:
+                title = topic.get("title") or f"Topic {topic.get('thread_id') or ''}"
+                tid = topic.get("thread_id") or "?"
+                purpose = topic.get("purpose_summary")
+                line = f"- {title} (`{tid}`)"
+                if purpose:
+                    line += f" - {purpose}"
+                lines.append(line)
+            return "\n".join(lines)
+
+        if args.lower() in {"memory", "summary"}:
+            topic = registry.get_topic(chat_id, thread_id) or registry.record_topic(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                chat_title=chat_title,
+                title=getattr(source, "chat_topic", None),
+                source="manual",
+            )
+            lines = [topic.get("title") or f"Topic {thread_id}"]
+            if topic.get("purpose_summary"):
+                lines.append(str(topic["purpose_summary"]))
+            facts = topic.get("pinned_facts") or []
+            loops = topic.get("open_loops") or []
+            if facts:
+                lines.append("Facts:")
+                lines.extend(f"- {fact}" for fact in facts[:8])
+            if loops:
+                lines.append("Open loops:")
+                lines.extend(f"- {loop}" for loop in loops[:8])
+            return "\n".join(lines)
+
+        if args.lower().startswith("skills"):
+            raw = args[len("skills"):].strip(" :")
+            skills = [part.strip() for part in raw.split(",") if part.strip()]
+            if not skills:
+                return "Usage: /topic skills skill-one, skill-two"
+            registry.record_topic(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                chat_title=chat_title,
+                title=getattr(source, "chat_topic", None),
+                auto_skills=skills,
+                source="manual",
+            )
+            return "Updated topic skills: " + ", ".join(skills)
+
+        if args.lower().startswith("set"):
+            raw = args[len("set"):].strip()
+            title, sep, purpose = raw.partition("::")
+            title = title.strip()
+            purpose = purpose.strip() if sep else None
+            if not title:
+                return "Usage: /topic set Topic title :: optional purpose"
+            registry.record_topic(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                chat_title=chat_title,
+                title=title,
+                purpose_summary=purpose,
+                source="manual",
+                latest_message_id=getattr(event, "message_id", None),
+            )
+            return f"Updated topic: {title}"
+
+        topic = registry.record_topic(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            chat_title=chat_title,
+            title=getattr(source, "chat_topic", None),
+            latest_message_id=getattr(event, "message_id", None),
+            source="manual",
+        )
+        title = topic.get("title") or f"Topic {thread_id}"
+        return f"Telegram topic: {title} (`{thread_id}`). Use /topic set, /topic skills, /topic memory, or /topics."
+
+
     async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:
         """Handle /topic for Telegram DM user-managed topic sessions."""
         source = event.source
-        if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
+        if source.platform != Platform.TELEGRAM:
+            return t("gateway.topic.not_telegram_dm")
+        if source.chat_type != "dm":
+            if source.thread_id:
+                return await self._handle_group_topic_command(event)
             return t("gateway.topic.not_telegram_dm")
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
