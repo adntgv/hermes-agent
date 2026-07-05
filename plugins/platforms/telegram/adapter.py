@@ -6698,11 +6698,26 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[%s] Loaded %d Telegram mention pattern(s)", self.name, len(compiled))
         return compiled
 
+    @staticmethod
+    def _telegram_chat_type_token(chat: Any) -> str:
+        token = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        # PTB enums stringify to values, while tests may provide MagicMock
+        # enum members whose repr contains the real token.
+        if "supergroup" in token:
+            return "supergroup"
+        if "group" in token:
+            return "group"
+        if "channel" in token:
+            return "channel"
+        if "private" in token:
+            return "private"
+        return token
+
     def _is_group_chat(self, message: Message) -> bool:
         chat = getattr(message, "chat", None)
         if not chat:
             return False
-        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_type = self._telegram_chat_type_token(chat)
         return chat_type in {"group", "supergroup"}
 
     @classmethod
@@ -6718,7 +6733,7 @@ class TelegramAdapter(BasePlatformAdapter):
         outbound routing must all agree on the same normalized value.
         """
         chat = getattr(message, "chat", None)
-        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        chat_type = cls._telegram_chat_type_token(chat)
         raw = getattr(message, "message_thread_id", None)
         is_topic_message = bool(getattr(message, "is_topic_message", False))
         is_forum_group = chat_type in ("group", "supergroup") and getattr(chat, "is_forum", False) is True
@@ -8190,7 +8205,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Determine chat type.  Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
         # string-like, but mocks often provide plain strings).
-        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        telegram_chat_type = self._telegram_chat_type_token(chat)
+
         chat_type = "dm"
         if telegram_chat_type in {"group", "supergroup"}:
             chat_type = "group"
@@ -8279,7 +8295,26 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
         )
-        
+
+        if chat_type == "group" and thread_id_str:
+            try:
+                from gateway.telegram_topics import TelegramTopicRegistry
+
+                TelegramTopicRegistry().record_message(
+                    chat_id=str(chat.id),
+                    thread_id=thread_id_str,
+                    chat_title=chat.title or None,
+                    topic_title=chat_topic,
+                    message_id=str(message.message_id),
+                    auto_skill=topic_skill,
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] Failed to record Telegram group topic metadata",
+                    getattr(self, "name", "telegram"),
+                    exc_info=True,
+                )
+
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)
         # so a user replying to a single selected substring of a prior
