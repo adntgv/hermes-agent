@@ -10030,6 +10030,132 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Telegram DM -> workspace topic routing.  This runs after normal
+        # authorization, before per-session interceptors, so Aidyn can use the
+        # private DM as an intake/control plane while execution happens visibly
+        # in the configured group topic.
+        if not is_internal:
+            try:
+                from gateway.dm_topic_router import (
+                    DmTopicRouteLedger,
+                    RouteDecision,
+                    RouteDestination,
+                    async_select_destination,
+                    build_dm_ack,
+                    build_dm_failure_ack,
+                    build_route_id,
+                    build_routed_work_packet,
+                    format_route_destination,
+                    is_routable_telegram_dm,
+                    load_dm_workspace_router_config,
+                    origin_key_for_event,
+                )
+
+                _telegram_platform_config = self.config.platforms.get(Platform.TELEGRAM)
+                _dm_router_config = load_dm_workspace_router_config(_telegram_platform_config)
+            except Exception:
+                logger.debug("Telegram DM workspace router config load failed", exc_info=True)
+                _dm_router_config = None
+
+            if _dm_router_config is not None and is_routable_telegram_dm(event, _dm_router_config):
+                _ledger = DmTopicRouteLedger()
+                _origin_key = origin_key_for_event(event)
+                _existing_route = _ledger.get_by_origin_key(_origin_key)
+                if _existing_route and isinstance(_existing_route.get("destination"), dict):
+                    _dest_meta = _existing_route.get("destination") or {}
+                    _decision = RouteDecision(
+                        routed=True,
+                        destination=RouteDestination(
+                            chat_id=_dest_meta.get("chat_id") or "",
+                            thread_id=_dest_meta.get("thread_id") or "",
+                            topic_title=_dest_meta.get("topic_title") or "Workspace",
+                            chat_name=_dest_meta.get("chat_name") or _dm_router_config.workspace_name,
+                        ),
+                    )
+                    return build_dm_ack(_decision, _existing_route.get("route_id") or "unknown", already=True)
+
+                _decision = await async_select_destination(event.text or "", _dm_router_config)
+                _route_id = build_route_id(event, _decision)
+                if not _decision.routed or not _decision.destination:
+                    return build_dm_failure_ack(_decision, _route_id, _decision.reason or "no destination topic selected")
+
+                _ledger.begin_route(event, _decision, _route_id)
+                _adapter = self.adapters.get(Platform.TELEGRAM)
+                if _adapter is None:
+                    _ledger.mark_failed(_origin_key, "telegram adapter unavailable")
+                    return build_dm_failure_ack(_decision, _route_id, "telegram adapter unavailable")
+
+                _packet = build_routed_work_packet(event, _decision, _route_id)
+                _send_result = await _adapter.send(
+                    _decision.destination.chat_id,
+                    _packet,
+                    metadata={"thread_id": _decision.destination.thread_id},
+                )
+                if not getattr(_send_result, "success", False):
+                    _error = getattr(_send_result, "error", None) or "unknown send failure"
+                    _ledger.mark_failed(_origin_key, _error)
+                    return build_dm_failure_ack(_decision, _route_id, _error)
+                _ledger.mark_sent(_origin_key, getattr(_send_result, "message_id", None))
+
+                _dm_ack = build_dm_ack(_decision, _route_id)
+                await _adapter.send(
+                    source.chat_id,
+                    "Started visible execution in "
+                    f"{format_route_destination(_decision.destination, include_thread=False)}.\n"
+                    f"Route ID: {_route_id}",
+                )
+
+                _topic_source = dataclasses.replace(
+                    source,
+                    chat_id=_decision.destination.chat_id,
+                    chat_name=_decision.destination.chat_name,
+                    chat_type="group",
+                    thread_id=_decision.destination.thread_id,
+                    message_id=getattr(_send_result, "message_id", None) or source.message_id,
+                )
+                _topic_event = dataclasses.replace(
+                    event,
+                    text=_packet,
+                    source=_topic_source,
+                    internal=True,
+                    message_id=getattr(_send_result, "message_id", None) or event.message_id,
+                )
+                _topic_key = self._session_key_for_source(_topic_source)
+                _ledger.mark_processing(_origin_key)
+                try:
+                    _run_generation = self._begin_session_run_generation(_topic_key)
+                    _agent_result = await self._handle_message_with_agent(
+                        _topic_event,
+                        _topic_source,
+                        _topic_key,
+                        _run_generation,
+                    )
+                    if isinstance(_agent_result, dict):
+                        _final_text = str(_agent_result.get("final_response") or "")
+                    else:
+                        _final_text = str(_agent_result or "")
+                    if _final_text.strip():
+                        _topic_final = f"[ROUTE {_route_id}] Final\n\n{_final_text}"
+                        _final_send = await _adapter.send(
+                            _decision.destination.chat_id,
+                            _topic_final,
+                            metadata={"thread_id": _decision.destination.thread_id},
+                        )
+                        _ledger.mark_done(_origin_key, getattr(_final_send, "message_id", None))
+                    else:
+                        _ledger.mark_done(_origin_key)
+                    await _adapter.send(
+                        source.chat_id,
+                        "Done in "
+                        f"{format_route_destination(_decision.destination, include_thread=False)}.\n"
+                        f"Route ID: {_route_id}",
+                    )
+                    return _dm_ack
+                except Exception as _route_exc:
+                    logger.exception("Telegram DM workspace routed execution failed")
+                    _ledger.mark_failed(_origin_key, str(_route_exc))
+                    return build_dm_failure_ack(_decision, _route_id, str(_route_exc))
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
