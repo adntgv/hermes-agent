@@ -153,6 +153,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
+    "platform.telegram.long_response_hosting": ("boto3==1.42.89",),
     # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for
     # Discord CDN's Brotli-encoded attachments. Without it, aiohttp falls
     # back to google's `Brotli` package (1-arg API), and any .txt/.md/.doc

@@ -1,10 +1,17 @@
+import builtins
+import re
+import sys
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock
 
 import pytest
 
+import agent.secret_scope as secret_scope
+
 import gateway.run as run_mod
 import gateway.telegram_long_response_html as long_html
+import tools.lazy_deps as lazy_deps
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 
@@ -99,6 +106,19 @@ def test_long_response_config_parses_visual_digest(monkeypatch):
                         "caption": "digest caption",
                         "send_raw_html": False,
                     },
+                    "hosting": {
+                        "enabled": True,
+                        "endpoint_url": "https://objects.example.test",
+                        "bucket": "reports",
+                        "public_base_url": "https://reports.example.test",
+                        "loader_url": "https://reports.example.test/long-responses/loader/index.html",
+                        "loader_version": "2",
+                        "key_prefix": "long-responses",
+                        "access_key_env": "REPORTS_ACCESS_KEY",
+                        "secret_key_env": "REPORTS_SECRET_KEY",
+                        "link_text": "Open full response",
+                        "fallback_to_attachment": True,
+                    },
                 }
             }
         },
@@ -110,6 +130,307 @@ def test_long_response_config_parses_visual_digest(monkeypatch):
     assert cfg["visual_digest"]["enabled"] is True
     assert cfg["visual_digest"]["caption"] == "digest caption"
     assert cfg["visual_digest"]["send_raw_html"] is False
+    assert cfg["hosting"] == {
+        "enabled": True,
+        "endpoint_url": "https://objects.example.test",
+        "bucket": "reports",
+        "public_base_url": "https://reports.example.test",
+        "loader_url": "https://reports.example.test/long-responses/loader/index.html",
+        "loader_version": "2",
+        "key_prefix": "long-responses",
+        "access_key_env": "REPORTS_ACCESS_KEY",
+        "secret_key_env": "REPORTS_SECRET_KEY",
+        "link_text": "Open full response",
+        "fallback_to_attachment": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_long_response_delivery_returns_hosted_link_without_attachment(monkeypatch, tmp_path):
+    runner = _runner()
+    runner._host_long_response_html = AsyncMock(
+        return_value="https://reports.example.test/long-responses/token/index.html"
+    )
+    adapter = SimpleNamespace(send_document=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    monkeypatch.setattr(long_html, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        run_mod,
+        "_load_gateway_config",
+        lambda: {
+            "telegram": {
+                "long_response_html": {
+                    "enabled": True,
+                    "threshold_chars": 10,
+                    "threshold_lines": 2,
+                    "hosting": {
+                        "enabled": True,
+                        "link_text": "Open full response",
+                    },
+                }
+            }
+        },
+    )
+
+    result = await runner._maybe_deliver_long_telegram_response_as_html(_event(), SAMPLE_RESPONSE)
+
+    assert result == "[Open full response](https://reports.example.test/long-responses/token/index.html)"
+    runner._host_long_response_html.assert_awaited_once()
+    adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_long_response_hosting_failure_falls_back_to_attachment(monkeypatch, tmp_path):
+    runner = _runner()
+    runner._host_long_response_html = AsyncMock(return_value=None)
+    adapter = SimpleNamespace(send_document=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    monkeypatch.setattr(long_html, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        run_mod,
+        "_load_gateway_config",
+        lambda: {
+            "telegram": {
+                "long_response_html": {
+                    "enabled": True,
+                    "threshold_chars": 10,
+                    "threshold_lines": 2,
+                    "notice": "Attachment fallback used.",
+                    "hosting": {
+                        "enabled": True,
+                        "fallback_to_attachment": True,
+                    },
+                }
+            }
+        },
+    )
+
+    result = await runner._maybe_deliver_long_telegram_response_as_html(_event(), SAMPLE_RESPONSE)
+
+    assert result == "Attachment fallback used."
+    adapter.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hosting_uses_profile_scoped_secrets_and_opaque_https_url(monkeypatch, tmp_path):
+    runner = _runner()
+    artifact = tmp_path / "response.html"
+    artifact.write_text("<p>safe</p>")
+    captured = {}
+
+    class FakeClient:
+        def upload_file(self, file_path, bucket, object_key, ExtraArgs):
+            captured.update(
+                file_path=file_path,
+                bucket=bucket,
+                object_key=object_key,
+                extra_args=ExtraArgs,
+            )
+
+    def fake_client(*args, **kwargs):
+        captured["client_kwargs"] = kwargs
+        return FakeClient()
+
+    monkeypatch.setattr(
+        lazy_deps,
+        "ensure",
+        lambda feature, prompt=False: captured.setdefault("ensure_calls", []).append((feature, prompt)),
+    )
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=fake_client))
+    monkeypatch.setitem(sys.modules, "botocore", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "botocore.client", SimpleNamespace(Config=lambda **kwargs: kwargs))
+    token = secret_scope.set_secret_scope({"REPORT_ACCESS": "scoped-user", "REPORT_SECRET": "scoped-secret"})
+    try:
+        url = await runner._host_long_response_html(
+            str(artifact),
+            {
+                "endpoint_url": "https://objects.example.test",
+                "bucket": "reports",
+                "public_base_url": "https://reports.example.test",
+                "loader_url": "https://reports.example.test/long-responses/loader/index.html",
+                "loader_version": "2",
+                "key_prefix": "long-responses",
+                "access_key_env": "REPORT_ACCESS",
+                "secret_key_env": "REPORT_SECRET",
+            },
+        )
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert url is not None
+    parsed_url = urlparse(url)
+    assert parsed_url.scheme == "https"
+    assert parsed_url.netloc == "reports.example.test"
+    assert parsed_url.path == "/long-responses/loader/index.html"
+    assert parse_qs(parsed_url.query) == {"v": ["2"]}
+    target_path = parse_qs(parsed_url.fragment)["path"][0]
+    assert re.fullmatch(r"/long-responses/[A-Za-z0-9_-]{24}/index\.html", target_path)
+    assert re.fullmatch(r"long-responses/[A-Za-z0-9_-]{24}/index\.html", captured["object_key"])
+    assert captured["ensure_calls"] == [("platform.telegram.long_response_hosting", False)]
+    assert captured["client_kwargs"]["aws_access_key_id"] == "scoped-user"
+    assert captured["client_kwargs"]["aws_secret_access_key"] == "scoped-secret"
+    assert captured["bucket"] == "reports"
+    assert captured["extra_args"] == {
+        "ContentType": "text/html; charset=utf-8",
+        "CacheControl": "private, no-store",
+    }
+
+
+@pytest.mark.asyncio
+async def test_hosting_rejects_non_https_public_url_before_upload(monkeypatch, tmp_path):
+    runner = _runner()
+    artifact = tmp_path / "response.html"
+    artifact.write_text("<p>safe</p>")
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        SimpleNamespace(client=lambda *args, **kwargs: pytest.fail("must not upload")),
+    )
+    monkeypatch.setitem(sys.modules, "botocore", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "botocore.client", SimpleNamespace(Config=lambda **kwargs: kwargs))
+    token = secret_scope.set_secret_scope({"REPORT_ACCESS": "user", "REPORT_SECRET": "secret"})
+    try:
+        url = await runner._host_long_response_html(
+            str(artifact),
+            {
+                "endpoint_url": "http://minio.internal",
+                "bucket": "reports",
+                "public_base_url": "http://reports.example.test",
+                "access_key_env": "REPORT_ACCESS",
+                "secret_key_env": "REPORT_SECRET",
+            },
+        )
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert url is None
+
+
+@pytest.mark.asyncio
+async def test_hosting_rejects_invalid_loader_before_upload(monkeypatch, tmp_path):
+    runner = _runner()
+    artifact = tmp_path / "response.html"
+    artifact.write_text("<p>safe</p>")
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        SimpleNamespace(client=lambda *args, **kwargs: pytest.fail("must not upload")),
+    )
+    monkeypatch.setitem(sys.modules, "botocore", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "botocore.client", SimpleNamespace(Config=lambda **kwargs: kwargs))
+    token = secret_scope.set_secret_scope({"REPORT_ACCESS": "user", "REPORT_SECRET": "secret"})
+    try:
+        url = await runner._host_long_response_html(
+            str(artifact),
+            {
+                "endpoint_url": "https://objects.example.test",
+                "bucket": "reports",
+                "public_base_url": "https://reports.example.test",
+                "loader_url": "https://other-origin.example.test/loader.html",
+                "loader_version": "invalid version with spaces",
+                "access_key_env": "REPORT_ACCESS",
+                "secret_key_env": "REPORT_SECRET",
+            },
+        )
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert url is None
+
+
+@pytest.mark.asyncio
+async def test_hosting_upload_error_returns_none_for_attachment_fallback(monkeypatch, tmp_path):
+    runner = _runner()
+    artifact = tmp_path / "response.html"
+    artifact.write_text("<p>safe</p>")
+
+    class FailingClient:
+        def upload_file(self, *args, **kwargs):
+            raise RuntimeError("simulated upload failure")
+
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=lambda *args, **kwargs: FailingClient()))
+    monkeypatch.setitem(sys.modules, "botocore", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "botocore.client", SimpleNamespace(Config=lambda **kwargs: kwargs))
+    token = secret_scope.set_secret_scope({"REPORT_ACCESS": "user", "REPORT_SECRET": "secret"})
+    try:
+        url = await runner._host_long_response_html(
+            str(artifact),
+            {
+                "endpoint_url": "https://objects.example.test",
+                "bucket": "reports",
+                "public_base_url": "https://reports.example.test",
+                "access_key_env": "REPORT_ACCESS",
+                "secret_key_env": "REPORT_SECRET",
+            },
+        )
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert url is None
+
+
+@pytest.mark.asyncio
+async def test_hosting_missing_boto3_returns_none_for_attachment_fallback(monkeypatch, tmp_path):
+    runner = _runner()
+    artifact = tmp_path / "response.html"
+    artifact.write_text("<p>safe</p>")
+    real_import = builtins.__import__
+
+    def import_without_boto3(name, *args, **kwargs):
+        if name == "boto3":
+            raise ImportError("simulated missing boto3")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "boto3", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_boto3)
+    token = secret_scope.set_secret_scope({"REPORT_ACCESS": "user", "REPORT_SECRET": "secret"})
+    try:
+        url = await runner._host_long_response_html(
+            str(artifact),
+            {
+                "endpoint_url": "https://objects.example.test",
+                "bucket": "reports",
+                "public_base_url": "https://reports.example.test",
+                "access_key_env": "REPORT_ACCESS",
+                "secret_key_env": "REPORT_SECRET",
+            },
+        )
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+    assert url is None
+
+
+def test_long_response_html_escapes_raw_html_and_sets_restrictive_csp(monkeypatch, tmp_path):
+    runner = _runner()
+    monkeypatch.setattr(long_html, "get_hermes_home", lambda: tmp_path)
+
+    path = runner._write_long_response_html_file(
+        "# Safe heading\n\n"
+        "> quoted text\n\n"
+        "<https://example.com>\n\n"
+        "Inline `<span>` code.\n\n"
+        "```html\n<div>fenced</div>\n```\n\n"
+        "[unsafe](javascript:alert(1))\n\n"
+        "<img src=x onerror=alert(1)>\n\n"
+        "<script>globalThis.PWNED=1</script>",
+        _event(),
+        ts="20260713T213500Z",
+    )
+    html_doc = (tmp_path / "artifacts" / "telegram-long-responses" / path.split("/")[-1]).read_text()
+
+    assert "<script>globalThis.PWNED=1</script>" not in html_doc
+    assert "&lt;script&gt;globalThis.PWNED=1&lt;/script&gt;" in html_doc
+    assert "<blockquote>" in html_doc and "quoted text" in html_doc
+    assert '<a href="https://example.com">https://example.com</a>' in html_doc
+    assert "<code>&lt;span&gt;</code>" in html_doc
+    assert "<code>&amp;lt;span&amp;gt;</code>" not in html_doc
+    assert "<pre><code class=\"language-html\">&lt;div&gt;fenced&lt;/div&gt;" in html_doc
+    assert "javascript:" not in html_doc
+    assert "onerror" not in html_doc
+    assert "Content-Security-Policy" in html_doc
+    assert "script-src 'none'" in html_doc
+    assert '<meta name="referrer" content="no-referrer">' in html_doc
 
 
 def test_parse_visual_digest_plan_supports_json_fences():

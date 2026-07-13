@@ -11,10 +11,102 @@ import html
 import json
 import re
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
+
+_SAFE_HTML_TAGS = frozenset({
+    "a", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3",
+    "h4", "h5", "h6", "hr", "img", "li", "ol", "p", "pre", "strong",
+    "table", "tbody", "td", "th", "thead", "tr", "ul",
+})
+_VOID_HTML_TAGS = frozenset({"br", "hr", "img"})
+_DANGEROUS_HTML_TAGS = frozenset({
+    "base", "embed", "form", "iframe", "link", "meta", "object", "script", "style",
+})
+
+
+def _safe_html_url(value: str, *, image: bool = False) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("#", "/", "./", "../")):
+        return True
+    parsed = urlparse(stripped)
+    allowed = {"http", "https"} if image else {"http", "https", "mailto", "tg"}
+    return parsed.scheme.lower() in allowed and bool(parsed.netloc or parsed.scheme in {"mailto", "tg"})
+
+
+class _RenderedHtmlSanitizer(HTMLParser):
+    """Allow Markdown's structural HTML while neutralizing raw executable HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.parts: list[str] = []
+
+    def _safe_attrs(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> str:
+        kept: list[str] = []
+        for raw_name, raw_value in attrs:
+            name = raw_name.lower()
+            value = raw_value or ""
+            allowed = False
+            if tag == "a" and name in {"href", "title"}:
+                allowed = name == "title" or _safe_html_url(value)
+            elif tag == "img" and name in {"src", "alt", "title"}:
+                allowed = name != "src" or _safe_html_url(value, image=True)
+            elif tag == "code" and name == "class":
+                allowed = bool(re.fullmatch(r"language-[A-Za-z0-9_+.-]+", value))
+            elif tag in {"th", "td"} and name == "align":
+                allowed = value.lower() in {"left", "center", "right"}
+            elif tag.startswith("h") and name == "id":
+                allowed = bool(re.fullmatch(r"[A-Za-z0-9_.:-]+", value))
+            if allowed:
+                kept.append(f' {name}="{html.escape(value, quote=True)}"')
+        return "".join(kept)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        if tag in _SAFE_HTML_TAGS:
+            suffix = " /" if tag in _VOID_HTML_TAGS else ""
+            self.parts.append(f"<{tag}{self._safe_attrs(tag, attrs)}{suffix}>")
+        elif tag in _DANGEROUS_HTML_TAGS:
+            self.parts.append(html.escape(self.get_starttag_text() or f"<{tag}>", quote=False))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in _SAFE_HTML_TAGS and tag not in _VOID_HTML_TAGS:
+            self.parts.append(f"</{tag}>")
+        elif tag in _DANGEROUS_HTML_TAGS:
+            self.parts.append(f"&lt;/{tag}&gt;")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(html.escape(data, quote=False))
+
+    def handle_entityref(self, name: str) -> None:
+        self.parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.parts.append(f"&#{name};")
+
+    def handle_comment(self, data: str) -> None:
+        return
+
+    def handle_decl(self, decl: str) -> None:
+        return
+
+
+def sanitize_rendered_markdown_html(rendered_html: str) -> str:
+    sanitizer = _RenderedHtmlSanitizer()
+    sanitizer.feed(rendered_html)
+    sanitizer.close()
+    return "".join(sanitizer.parts)
+
 
 _VISUAL_REPORT_MANIFEST_RELATIVE_PATH = Path("web/src/features/visual-reports/manifest.json")
 _VISUAL_REPORT_MANIFEST_PROMPT_FIELDS = (
@@ -562,6 +654,8 @@ def write_long_response_html_file(
         "<!doctype html>\n"
         "<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        "<meta name=\"referrer\" content=\"no-referrer\">"
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\">"
         "<title>Hermes response</title>"
         "<style>"
         ":root{color-scheme:dark light}html,body{width:100%;max-width:100%;overflow-x:hidden}body{margin:0;padding:24px;font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#0f1115;color:#f2f4f8}"

@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import site
 import sys
@@ -45,6 +46,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlencode, urlparse
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -64,6 +66,7 @@ from gateway.telegram_long_response_html import (
     build_artifact_paths as _build_long_response_html_paths,
     load_visual_report_registry_manifest_for_prompt as _load_visual_report_registry_manifest_for_prompt,
     parse_visual_digest_plan as _parse_visual_digest_plan,
+    sanitize_rendered_markdown_html as _sanitize_rendered_markdown_html,
     write_long_response_html_file as _write_long_response_html_file,
     write_visual_digest_html_file as _write_visual_digest_html_file,
 )
@@ -14627,6 +14630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         telegram_cfg = cfg.get("telegram") if isinstance(cfg.get("telegram"), dict) else {}
         raw = telegram_cfg.get("long_response_html") if isinstance(telegram_cfg.get("long_response_html"), dict) else {}
         visual_raw = raw.get("visual_digest") if isinstance(raw.get("visual_digest"), dict) else {}
+        hosting_raw = raw.get("hosting") if isinstance(raw.get("hosting"), dict) else {}
         return {
             "enabled": bool(raw.get("enabled", False)),
             "threshold_chars": int(raw.get("threshold_chars", 1400) or 1400),
@@ -14637,6 +14641,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "enabled": bool(visual_raw.get("enabled", False)),
                 "caption": str(visual_raw.get("caption") or "Visual digest attached as HTML."),
                 "send_raw_html": bool(visual_raw.get("send_raw_html", True)),
+            },
+            "hosting": {
+                "enabled": bool(hosting_raw.get("enabled", False)),
+                "endpoint_url": str(hosting_raw.get("endpoint_url") or ""),
+                "bucket": str(hosting_raw.get("bucket") or ""),
+                "public_base_url": str(hosting_raw.get("public_base_url") or ""),
+                "loader_url": str(hosting_raw.get("loader_url") or ""),
+                "loader_version": str(hosting_raw.get("loader_version") or "1"),
+                "key_prefix": str(hosting_raw.get("key_prefix") or "long-responses"),
+                "access_key_env": str(hosting_raw.get("access_key_env") or "MINIO_REPORTS_ACCESS_KEY"),
+                "secret_key_env": str(hosting_raw.get("secret_key_env") or "MINIO_REPORTS_SECRET_KEY"),
+                "link_text": str(hosting_raw.get("link_text") or "Open full response"),
+                "fallback_to_attachment": bool(hosting_raw.get("fallback_to_attachment", True)),
             },
         }
 
@@ -14655,6 +14672,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _write_long_response_html_file(self, response: str, event: MessageEvent, *, ts: Optional[str] = None) -> str:
         """Write a self-contained HTML rendering of a long gateway response."""
         return _write_long_response_html_file(response, event, self._render_md_to_html, ts=ts)
+
+    async def _host_long_response_html(self, file_path: str, hosting_cfg: dict) -> Optional[str]:
+        """Upload a long-response artifact and return its public HTTPS URL."""
+
+        def _upload() -> Optional[str]:
+            endpoint_url = str(hosting_cfg.get("endpoint_url") or "").rstrip("/")
+            bucket = str(hosting_cfg.get("bucket") or "").strip("/")
+            public_base_url = str(hosting_cfg.get("public_base_url") or "").rstrip("/")
+            if not public_base_url and endpoint_url and bucket:
+                public_base_url = f"{endpoint_url}/{bucket}"
+            parsed_public_url = urlparse(public_base_url)
+            if (
+                parsed_public_url.scheme != "https"
+                or not parsed_public_url.netloc
+                or parsed_public_url.username
+                or parsed_public_url.password
+                or parsed_public_url.query
+                or parsed_public_url.fragment
+            ):
+                logger.warning("Telegram long-response hosting requires a valid credential-free HTTPS public_base_url")
+                return None
+
+            loader_url = str(hosting_cfg.get("loader_url") or "").rstrip("/")
+            loader_query = ""
+            if loader_url:
+                parsed_loader_url = urlparse(loader_url)
+                if (
+                    parsed_loader_url.scheme != "https"
+                    or not parsed_loader_url.netloc
+                    or parsed_loader_url.netloc != parsed_public_url.netloc
+                    or parsed_loader_url.username
+                    or parsed_loader_url.password
+                    or parsed_loader_url.query
+                    or parsed_loader_url.fragment
+                ):
+                    logger.warning("Telegram long-response loader_url must be a credential-free HTTPS URL on the public report origin")
+                    return None
+                loader_version = str(hosting_cfg.get("loader_version") or "1")
+                if not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", loader_version):
+                    logger.warning("Telegram long-response loader_version contains unsupported characters")
+                    return None
+                loader_query = urlencode({"v": loader_version})
+
+            access_key_env = str(hosting_cfg.get("access_key_env") or "")
+            secret_key_env = str(hosting_cfg.get("secret_key_env") or "")
+            if not endpoint_url or not bucket or not access_key_env or not secret_key_env:
+                logger.warning("Telegram long-response hosting is enabled but storage configuration is incomplete")
+                return None
+            from agent.secret_scope import get_secret
+
+            access_key = get_secret(access_key_env, "") or ""
+            secret_key = get_secret(secret_key_env, "") or ""
+            if not access_key or not secret_key:
+                logger.warning("Telegram long-response hosting credentials are unavailable in the active profile scope")
+                return None
+            try:
+                from tools.lazy_deps import ensure as ensure_lazy_dependency
+                ensure_lazy_dependency("platform.telegram.long_response_hosting", prompt=False)
+                import boto3
+                from botocore.client import Config
+            except (ImportError, RuntimeError) as exc:
+                logger.warning("Telegram long-response hosting requires boto3; using configured fallback: %s", exc)
+                return None
+
+            prefix = str(hosting_cfg.get("key_prefix") or "long-responses").strip("/")
+            object_key = f"{prefix}/{secrets.token_urlsafe(18)}/index.html"
+            client = boto3.client(
+                "s3",
+                endpoint_url=endpoint_url,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                config=Config(signature_version="s3v4"),
+                region_name="us-east-1",
+            )
+            client.upload_file(
+                file_path,
+                bucket,
+                object_key,
+                ExtraArgs={
+                    "ContentType": "text/html; charset=utf-8",
+                    "CacheControl": "private, no-store",
+                },
+            )
+            direct_url = f"{public_base_url}/{object_key}"
+            if not loader_url:
+                return direct_url
+            target_fragment = urlencode({"path": urlparse(direct_url).path})
+            return f"{loader_url}?{loader_query}#{target_fragment}"
+
+        try:
+            return await asyncio.to_thread(_upload)
+        except Exception as exc:
+            logger.warning("Telegram long-response hosting failed: %s", exc, exc_info=True)
+            return None
 
     def _write_visual_digest_html_file(self, response: str, event: MessageEvent, *, plan: dict, ts: Optional[str] = None) -> str:
         """Write a mobile-first visual digest companion HTML for long responses."""
@@ -14747,13 +14858,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return _parse_visual_digest_plan(planner_text, response)
 
     def _render_md_to_html(self, md_text: str) -> str:
-        """Render markdown text to HTML."""
+        """Render Markdown, then sanitize the generated HTML."""
         try:
             import markdown as md_lib
             extensions = ["fenced_code", "tables", "toc", "nl2br", "sane_lists"]
-            return md_lib.markdown(md_text, extensions=extensions)
-        except ImportError:
-            return f"<pre>{html.escape(md_text)}</pre>"
+            rendered = md_lib.markdown(md_text, extensions=extensions)
+        except Exception:
+            rendered = "<pre>" + html.escape(md_text) + "</pre>"
+        return _sanitize_rendered_markdown_html(rendered)
 
     async def _maybe_deliver_long_telegram_response_as_html(
         self,
@@ -14767,8 +14879,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._response_requires_html_document(response, cfg):
             return None
         adapter = self.adapters.get(event.source.platform)
-        if not adapter or not hasattr(adapter, "send_document"):
-            return None
         try:
             reply_anchor = self._reply_anchor_for_event(event)
             metadata = self._thread_metadata_for_source(event.source, reply_anchor)
@@ -14777,7 +14887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             visual_cfg = cfg.get("visual_digest") if isinstance(cfg.get("visual_digest"), dict) else {}
             visual_attempted = False
             visual_sent = False
-            if visual_cfg.get("enabled"):
+            if visual_cfg.get("enabled") and adapter and hasattr(adapter, "send_document"):
                 visual_attempted = True
                 try:
                     plan = await self._plan_visual_digest(event, response)
@@ -14803,6 +14913,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info("Telegram long-response visual planner returned no usable plan; skipping visual digest")
             if sent_docs == 0 or visual_cfg.get("send_raw_html", True):
                 html_path = self._write_long_response_html_file(response, event, ts=ts)
+                hosting_cfg = cfg.get("hosting") if isinstance(cfg.get("hosting"), dict) else {}
+                if hosting_cfg.get("enabled"):
+                    hosted_url = await self._host_long_response_html(html_path, hosting_cfg)
+                    if hosted_url:
+                        link_text = str(hosting_cfg.get("link_text") or "Open full response")
+                        link_text = link_text.replace("[", "").replace("]", "")
+                        return f"[{link_text}]({hosted_url})"
+                    if not hosting_cfg.get("fallback_to_attachment", True):
+                        return None
+                if not adapter or not hasattr(adapter, "send_document"):
+                    return None
                 result = await adapter.send_document(
                     chat_id=event.source.chat_id,
                     file_path=html_path,
