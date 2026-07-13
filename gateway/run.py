@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import html
 import inspect
 import json
 import logging
@@ -58,6 +59,14 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.visual_report_store import save_latest_report as _save_latest_visual_report
+from gateway.telegram_long_response_html import (
+    build_artifact_paths as _build_long_response_html_paths,
+    load_visual_report_registry_manifest_for_prompt as _load_visual_report_registry_manifest_for_prompt,
+    parse_visual_digest_plan as _parse_visual_digest_plan,
+    write_long_response_html_file as _write_long_response_html_file,
+    write_visual_digest_html_file as _write_visual_digest_html_file,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -13536,6 +13545,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            if response and not agent_result.get("already_sent") and not _intentional_silence:
+                _html_notice = await self._maybe_deliver_long_telegram_response_as_html(event, response)
+                if _html_notice:
+                    response = _html_notice
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
@@ -14606,6 +14620,212 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     os.unlink(p)
                 except OSError:
                     pass
+
+    def _telegram_long_response_html_config(self) -> dict:
+        """Return Telegram long-response HTML delivery config."""
+        cfg = _load_gateway_config()
+        telegram_cfg = cfg.get("telegram") if isinstance(cfg.get("telegram"), dict) else {}
+        raw = telegram_cfg.get("long_response_html") if isinstance(telegram_cfg.get("long_response_html"), dict) else {}
+        visual_raw = raw.get("visual_digest") if isinstance(raw.get("visual_digest"), dict) else {}
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "threshold_chars": int(raw.get("threshold_chars", 1400) or 1400),
+            "threshold_lines": int(raw.get("threshold_lines", 18) or 18),
+            "notice": str(raw.get("notice") or "Full response is attached as an HTML file."),
+            "caption": str(raw.get("caption") or "Full response attached as HTML."),
+            "visual_digest": {
+                "enabled": bool(visual_raw.get("enabled", False)),
+                "caption": str(visual_raw.get("caption") or "Visual digest attached as HTML."),
+                "send_raw_html": bool(visual_raw.get("send_raw_html", True)),
+            },
+        }
+
+    def _response_requires_html_document(self, response: str, cfg: dict) -> bool:
+        """Return True when a Telegram reply is likely to require scrolling."""
+        if not response or not cfg.get("enabled"):
+            return False
+        threshold_chars = max(1, int(cfg.get("threshold_chars") or 1400))
+        threshold_lines = max(1, int(cfg.get("threshold_lines") or 18))
+        return len(response) > threshold_chars or response.count("\n") + 1 > threshold_lines
+
+    def _long_response_html_paths(self, event: MessageEvent, ts: Optional[str] = None) -> tuple[str, str, str]:
+        """Return timestamp plus raw/visual artifact paths for a Telegram response."""
+        return _build_long_response_html_paths(event, ts)
+
+    def _write_long_response_html_file(self, response: str, event: MessageEvent, *, ts: Optional[str] = None) -> str:
+        """Write a self-contained HTML rendering of a long gateway response."""
+        return _write_long_response_html_file(response, event, self._render_md_to_html, ts=ts)
+
+    def _write_visual_digest_html_file(self, response: str, event: MessageEvent, *, plan: dict, ts: Optional[str] = None) -> str:
+        """Write a mobile-first visual digest companion HTML for long responses."""
+        path = _write_visual_digest_html_file(response, event, self._render_md_to_html, plan=plan, ts=ts)
+        try:
+            source = getattr(event, "source", None)
+            platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+            _save_latest_visual_report(
+                plan,
+                source_response=response,
+                source_metadata={"artifact_path": path},
+                event_metadata={
+                    "platform": platform,
+                    "chat_id": getattr(source, "chat_id", ""),
+                    "thread_id": getattr(source, "thread_id", ""),
+                    "topic": getattr(source, "chat_topic", ""),
+                },
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist latest visual report: %s", exc, exc_info=True)
+        return path
+
+    def _build_visual_digest_planner_messages(self, event: MessageEvent, response: str) -> list[dict[str, str]]:
+        """Return the auxiliary LLM prompt for planning a meaning-first visual artifact."""
+        topic = str(getattr(event.source, "chat_topic", "") or "")
+        platform = str(getattr(event.source.platform, "value", event.source.platform) or "")
+        source_context = f"platform={platform}; topic={topic or 'none'}"
+        registry_manifest = _load_visual_report_registry_manifest_for_prompt()
+        registered_types = [entry["type"] for entry in registry_manifest]
+        output_shape = {
+            "title": "short title",
+            "summary": "1-2 sentence comprehension-first summary",
+            "theme_hint": "briefing|decision|system|plan|comparison|timeline|report|explainer",
+            "metrics": [{"label": "exact source metric label", "value": "exact source value"}],
+            "blocks": [
+                {
+                    "type": "one registered component type from registry_manifest",
+                    "title": "block title",
+                    "component_specific_fields": "flatten fields from that component's dataShape directly here at block root",
+                }
+            ],
+        }
+        system = (
+            "You are Hermes Visual Planner. Treat HTML as a visual canvas, not a container for styled Markdown. "
+            "Analyze the source meaning first: entities, time, dependencies, state, priority, quantities, ownership, blockers, and exact details. "
+            "Then choose visual representations that expose those relationships. Do not default to hero + cards + checklist + full markdown. "
+            "You may only select registered visual report component types from the provided registry manifest; never invent block types or use unregistered legacy helpers. "
+            "Prefer gantt for work across time, kanban for state, priority_matrix for impact/urgency, dependency_graph for prerequisites, flow for procedures, progress for grounded completion values, comparison_table for tradeoffs, chart for explicit numeric series, and details for lossless drill-down. "
+            "The first screen must provide insight unavailable from merely styling the original document. Preserve all operationally relevant details in visual labels or collapsible details; never invent facts, dates, percentages, effort, progress, or dependencies. "
+            "Return JSON only, no prose and no code fences."
+        )
+        user = (
+            f"Context: {source_context}\n\n"
+            "Create a visual artifact plan for the following assistant response.\n"
+            "Constraints:\n"
+            "- optimize for fast comprehension on iPhone; essential content must still work without JavaScript\n"
+            f"- only select registered visual report component types: {', '.join(registered_types)}\n"
+            "- first identify what should be represented visually, then choose 3-7 complementary blocks\n"
+            "- use at least two relationship-bearing visual blocks when the source contains time, state, dependencies, priority, or process\n"
+            "- reserve details for supporting exact evidence, not as the primary representation unless the source is mostly reference text\n"
+            "- use details sections to preserve exact tasks or evidence that would otherwise be lost\n"
+            "- metrics and progress values must exist in the source; do not estimate them\n"
+            "- every block must be grounded in the source response; omit unsupported axes or values\n"
+            "- flatten component-specific fields at each block root according to the selected component's dataShape; do not nest them under payload, props, data, or config\n"
+            "- do not repeat the same fact in multiple blocks unless it clarifies a dependency\n\n"
+            f"Output JSON shape:\n{json.dumps(output_shape, ensure_ascii=False, indent=2)}\n\n"
+            f"Registry manifest:\n{json.dumps(registry_manifest, ensure_ascii=False, indent=2)}\n\n"
+            f"Assistant response to transform:\n{response}"
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+    async def _plan_visual_digest(self, event: MessageEvent, response: str) -> Optional[dict]:
+        """Run an auxiliary LLM pass that plans the visual digest artifact."""
+        from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+
+        messages = self._build_visual_digest_planner_messages(event, response)
+        planner_response = await async_call_llm(
+            task="telegram_visual_digest",
+            messages=messages,
+            temperature=0.2,
+            max_tokens=2200,
+            timeout=45,
+        )
+        planner_text = extract_content_or_reasoning(planner_response).strip()
+        if not planner_text:
+            return None
+        return _parse_visual_digest_plan(planner_text, response)
+
+    def _render_md_to_html(self, md_text: str) -> str:
+        """Render markdown text to HTML."""
+        try:
+            import markdown as md_lib
+            extensions = ["fenced_code", "tables", "toc", "nl2br", "sane_lists"]
+            return md_lib.markdown(md_text, extensions=extensions)
+        except ImportError:
+            return f"<pre>{html.escape(md_text)}</pre>"
+
+    async def _maybe_deliver_long_telegram_response_as_html(
+        self,
+        event: MessageEvent,
+        response: str,
+    ) -> Optional[str]:
+        """Send long Telegram responses as HTML documents and return short notice."""
+        if event.source.platform != Platform.TELEGRAM:
+            return None
+        cfg = self._telegram_long_response_html_config()
+        if not self._response_requires_html_document(response, cfg):
+            return None
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter or not hasattr(adapter, "send_document"):
+            return None
+        try:
+            reply_anchor = self._reply_anchor_for_event(event)
+            metadata = self._thread_metadata_for_source(event.source, reply_anchor)
+            ts, _, _ = self._long_response_html_paths(event)
+            sent_docs = 0
+            visual_cfg = cfg.get("visual_digest") if isinstance(cfg.get("visual_digest"), dict) else {}
+            visual_attempted = False
+            visual_sent = False
+            if visual_cfg.get("enabled"):
+                visual_attempted = True
+                try:
+                    plan = await self._plan_visual_digest(event, response)
+                except Exception as exc:
+                    plan = None
+                    logger.warning("Telegram long-response visual planner failed: %s", exc, exc_info=True)
+                if plan:
+                    visual_path = self._write_visual_digest_html_file(response, event, plan=plan, ts=ts)
+                    visual_result = await adapter.send_document(
+                        chat_id=event.source.chat_id,
+                        file_path=visual_path,
+                        caption=str(visual_cfg.get("caption") or "Visual digest attached as HTML."),
+                        file_name=os.path.basename(visual_path),
+                        reply_to=reply_anchor,
+                        metadata=metadata,
+                    )
+                    if getattr(visual_result, "success", False):
+                        sent_docs += 1
+                        visual_sent = True
+                    else:
+                        logger.warning("Telegram long-response visual digest upload failed: %s", getattr(visual_result, "error", "unknown"))
+                else:
+                    logger.info("Telegram long-response visual planner returned no usable plan; skipping visual digest")
+            if sent_docs == 0 or visual_cfg.get("send_raw_html", True):
+                html_path = self._write_long_response_html_file(response, event, ts=ts)
+                result = await adapter.send_document(
+                    chat_id=event.source.chat_id,
+                    file_path=html_path,
+                    caption=str(cfg.get("caption") or "Full response attached as HTML."),
+                    file_name=os.path.basename(html_path),
+                    reply_to=reply_anchor,
+                    metadata=metadata,
+                )
+                if getattr(result, "success", False):
+                    sent_docs += 1
+                else:
+                    logger.warning("Telegram long-response HTML upload failed: %s", getattr(result, "error", "unknown"))
+            if sent_docs > 0:
+                if visual_sent and sent_docs > 1:
+                    return "Visual digest and full response are attached as HTML files."
+                if visual_sent:
+                    return "Visual digest is attached as an HTML file."
+                if visual_attempted:
+                    return str(cfg.get("notice") or "Full response is attached as an HTML file.")
+                return str(cfg.get("notice") or "Full response is attached as an HTML file.")
+        except Exception as exc:
+            logger.warning("Telegram long-response HTML delivery failed: %s", exc, exc_info=True)
+        return None
 
     async def _deliver_media_from_response(
         self,

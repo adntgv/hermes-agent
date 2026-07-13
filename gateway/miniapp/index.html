@@ -3,73 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#f8fafc" />
-  <title>Hermes Board</title>
+  <meta name="theme-color" content="#f7f3ec" />
+  <title>Hermes Report</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="/miniapp/assets/styles.css?v=20260521-board-tool" />
+  <link rel="stylesheet" href="/miniapp/assets/styles.css?v=report-reader-20260711" />
 </head>
 <body>
-  <main class="collaboration-board" data-config-url="/miniapp/config.json">
-    <header class="topbar" aria-label="Board controls">
-      <div class="brand-lockup">
-        <div class="mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" role="img">
-            <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v11a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5z" />
-            <path d="M8 8h8M8 12h5M8 16h8" />
-          </svg>
-        </div>
-        <div>
-          <h1 id="board-title">Hermes Board</h1>
-          <p id="board-subtitle">Blank collaboration space</p>
-        </div>
+  <main class="report-app" data-config-url="/miniapp/config.json">
+    <header class="app-toolbar" aria-label="Report controls">
+      <div>
+        <p class="kicker">Hermes Report</p>
+        <h1 id="report-title">Latest report</h1>
       </div>
-
-      <div class="presence" aria-label="Collaborators">
-        <span class="avatar aidyn">A</span>
-        <span class="avatar hermes" id="hermes-avatar">H</span>
-      </div>
+      <nav class="toolbar-actions" aria-label="Actions">
+        <button id="refresh-report" class="icon-button" type="button" aria-label="Refresh report">↻</button>
+        <button id="close-miniapp" class="icon-button" type="button" aria-label="Close">×</button>
+      </nav>
     </header>
 
-    <aside class="tool-dock" aria-label="Board tools">
-      <button class="tool is-active" type="button" data-tool="pan" aria-label="Pan board">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11V8a1.5 1.5 0 0 1 3 0v3M10 11V6.5a1.5 1.5 0 0 1 3 0V11M13 11V8a1.5 1.5 0 0 1 3 0v4M16 12v-1a1.5 1.5 0 0 1 3 0v3.2a5.8 5.8 0 0 1-5.8 5.8H12a6 6 0 0 1-4.2-1.7L5 15.5a1.6 1.6 0 0 1 2.2-2.3L9 15" /></svg>
-      </button>
-      <button class="tool" type="button" data-tool="note" aria-label="Add sticky note">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12a2 2 0 0 1 2 2v9l-5 5H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" /><path d="M15 20v-5h5" /></svg>
-      </button>
-      <button class="tool" type="button" data-tool="frame" aria-label="Add frame">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z" /><path d="M9 5v14M15 5v14M5 9h14M5 15h14" /></svg>
-      </button>
-    </aside>
-
-    <aside class="reaction-panel" aria-label="Hermes reactions">
-      <div class="reaction-title">Hermes live</div>
-      <div id="reaction-feed" class="reaction-feed" aria-live="polite"></div>
-    </aside>
-
-    <section class="board-viewport" aria-label="Empty collaboration board">
-      <div id="board-canvas" class="board-canvas dotted-grid">
-        <div class="origin-cross" aria-hidden="true"></div>
-        <div class="empty-state" aria-label="Empty board guidance">
-          <div class="empty-icon" aria-hidden="true"></div>
-          <h2>Empty board</h2>
-          <p>Tap the note/frame tools or double-tap anywhere to create. Drag objects to arrange.</p>
-        </div>
-      </div>
-    </section>
-
-    <div id="hermes-cursor" class="hermes-cursor" aria-hidden="true">
-      <span class="cursor-dot">H</span>
-      <span class="cursor-label">Hermes</span>
-    </div>
-
-    <footer class="statusbar" aria-label="Board status">
-      <span id="telegram-status">Telegram: detecting</span>
-      <span id="zoom-status">100%</span>
-      <span id="action-status">Tap note to create</span>
-    </footer>
+    <section id="status" class="status" role="status" aria-live="polite">Loading latest report.</section>
+    <article id="report" class="report" aria-live="polite" hidden></article>
   </main>
-
-  <script src="/miniapp/assets/app.js?v=20260521-board-tool"></script>
+  <script src="/miniapp/assets/app.js?v=report-reader-20260711"></script>
 </body>
 </html>

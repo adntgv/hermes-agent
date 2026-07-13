@@ -1,432 +1,337 @@
-const STORAGE_KEY = 'hermes-miniapp-board-v1';
-
 const state = {
-  panX: 0,
-  panY: 0,
-  zoom: 1,
-  activeTool: 'pan',
-  pointer: null,
-  lastTapAt: 0,
-  items: [],
-  revision: 0,
-  boardEndpoint: '/miniapp/api/board',
-  remoteSaveTimer: null,
-  isApplyingRemote: false,
+  endpoint: '/miniapp/api/report/latest',
+  configUrl: document.querySelector('.report-app')?.dataset.configUrl || '/miniapp/config.json',
 };
 
 const els = {
-  root: document.querySelector('.collaboration-board'),
-  canvas: document.querySelector('#board-canvas'),
-  title: document.querySelector('#board-title'),
-  subtitle: document.querySelector('#board-subtitle'),
-  telegramStatus: document.querySelector('#telegram-status'),
-  zoomStatus: document.querySelector('#zoom-status'),
-  actionStatus: document.querySelector('#action-status'),
-  reactionFeed: document.querySelector('#reaction-feed'),
-  hermesCursor: document.querySelector('#hermes-cursor'),
-  hermesAvatar: document.querySelector('#hermes-avatar'),
-  tools: [...document.querySelectorAll('.tool[data-tool]')],
-  empty: document.querySelector('.empty-state'),
+  title: document.querySelector('#report-title'),
+  status: document.querySelector('#status'),
+  report: document.querySelector('#report'),
+  refresh: document.querySelector('#refresh-report'),
+  close: document.querySelector('#close-miniapp'),
 };
 
-const REACTIONS = {
-  note: ['I added a note shell', 'Good, capture the raw idea here', 'I am watching this note'],
-  frame: ['Frame ready — put a flow inside', 'Nice, let us group this', 'I marked a space for structure'],
-  move: ['Moved — layout is getting clearer', 'I see the arrangement change', 'Position noted'],
-  edit: ['Text updated', 'I see the wording change', 'Saved this wording locally'],
-  tool: ['Tool switched', 'Ready for the next action'],
-  clear: ['Board cleared', 'Fresh canvas again'],
-};
+const SUPPORTED_TYPES = new Set([
+  'metric', 'progress', 'timeline', 'gantt', 'kanban', 'priority_matrix', 'dependency_graph',
+  'flow', 'flowchart', 'comparison_table', 'chart', 'canvas_network', 'three_scene', 'details',
+  'key_points', 'insight_cards', 'sequence', 'checklist', 'callout', 'markdown', 'mermaid',
+]);
 
-function setStatus(text) {
-  if (els.actionStatus) els.actionStatus.textContent = text;
+function text(value, fallback = '') {
+  if (value === null || value === undefined) return fallback;
+  return String(value);
 }
 
-function pickReaction(kind) {
-  const list = REACTIONS[kind] || REACTIONS.tool;
-  return list[Math.floor(Math.random() * list.length)];
+function number(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function boardToViewport(point) {
-  const rect = els.root.getBoundingClientRect();
-  return {
-    x: rect.width / 2 + state.panX + point.x * state.zoom,
-    y: rect.height / 2 + state.panY + point.y * state.zoom,
-  };
-}
-
-function pulseHermes() {
-  els.hermesAvatar?.classList.remove('is-reacting');
-  void els.hermesAvatar?.offsetWidth;
-  els.hermesAvatar?.classList.add('is-reacting');
-}
-
-function moveHermesCursor(point) {
-  if (!els.hermesCursor || !point) return;
-  const viewport = boardToViewport(point);
-  els.hermesCursor.style.setProperty('--cursor-x', `${viewport.x}px`);
-  els.hermesCursor.style.setProperty('--cursor-y', `${viewport.y}px`);
-  els.hermesCursor.classList.add('is-visible');
-}
-
-function showHermesReaction(kind, point, detail = '') {
-  const message = detail || pickReaction(kind);
-  setStatus(`Hermes: ${message}`);
-  pulseHermes();
-  moveHermesCursor(point || centerBoardPoint(-28, -16));
-
-  if (!els.reactionFeed) return;
-  const row = document.createElement('div');
-  row.className = 'reaction-row';
-  row.innerHTML = `<span class="reaction-speaker">H</span><span>${message}</span>`;
-  els.reactionFeed.prepend(row);
-  [...els.reactionFeed.children].slice(4).forEach((node) => node.remove());
-}
-
-function setBoardTransform() {
-  document.documentElement.style.setProperty('--pan-x', `${state.panX}px`);
-  document.documentElement.style.setProperty('--pan-y', `${state.panY}px`);
-  document.documentElement.style.setProperty('--zoom', `${state.zoom}`);
-  els.zoomStatus.textContent = `${Math.round(state.zoom * 100)}%`;
-}
-
-function saveBoard() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state.items));
-  } catch (_) {}
-  if (!state.isApplyingRemote) scheduleRemoteSave();
-}
-
-function latestRemoteEvent(board) {
-  if (!board?.events?.length) return null;
-  return board.events[board.events.length - 1];
-}
-
-async function postBoardAction(payload) {
-  const response = await fetch(state.boardEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+function el(tag, attrs = {}, children = []) {
+  const node = document.createElement(tag);
+  Object.entries(attrs).forEach(([key, value]) => {
+    if (value === false || value === null || value === undefined) return;
+    if (key === 'class') node.className = value;
+    else if (key === 'text') node.textContent = text(value);
+    else node.setAttribute(key, text(value));
   });
-  if (!response.ok) throw new Error(`board HTTP ${response.status}`);
-  const result = await response.json();
-  if (result?.board?.revision !== undefined) state.revision = result.board.revision;
-  return result;
-}
-
-function scheduleRemoteSave() {
-  clearTimeout(state.remoteSaveTimer);
-  state.remoteSaveTimer = setTimeout(() => {
-    postBoardAction({ action: 'set', items: state.items, detail: 'Aidyn updated the board' })
-      .catch(() => setStatus('Saved locally · server sync pending'));
-  }, 180);
-}
-
-function applyRemoteBoard(board, announce = true) {
-  if (!board || !Array.isArray(board.items)) return;
-  if ((board.revision || 0) < state.revision) return;
-  state.isApplyingRemote = true;
-  state.items = board.items;
-  state.revision = board.revision || 0;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state.items));
-  } catch (_) {}
-  renderItems();
-  state.isApplyingRemote = false;
-  const event = latestRemoteEvent(board);
-  if (announce && event?.actor === 'Hermes') {
-    showHermesReaction(event.action || 'tool', event, event.detail || 'Board updated by Hermes');
-  }
-}
-
-async function fetchRemoteBoard(announce = true) {
-  const response = await fetch(state.boardEndpoint, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`board HTTP ${response.status}`);
-  const result = await response.json();
-  const board = result?.board;
-  if (board && (board.revision || 0) > state.revision) applyRemoteBoard(board, announce);
-  return board;
-}
-
-function loadBoard() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-    if (Array.isArray(parsed)) state.items = parsed.slice(0, 80);
-  } catch (_) {
-    state.items = [];
-  }
-}
-
-function updateEmptyState() {
-  els.empty?.classList.toggle('is-hidden', state.items.length > 0);
-}
-
-function makeId() {
-  return `item-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-}
-
-function viewportToBoard(clientX, clientY) {
-  const rect = els.root.getBoundingClientRect();
-  return {
-    x: (clientX - rect.left - rect.width / 2 - state.panX) / state.zoom,
-    y: (clientY - rect.top - rect.height / 2 - state.panY) / state.zoom,
-  };
-}
-
-function centerBoardPoint(offsetX = 0, offsetY = 0) {
-  const rect = els.root.getBoundingClientRect();
-  return viewportToBoard(rect.left + rect.width / 2 + offsetX, rect.top + rect.height / 2 + offsetY);
-}
-
-function itemTemplate(item) {
-  const node = document.createElement('article');
-  node.className = `board-item ${item.type === 'frame' ? 'board-frame' : 'sticky-note'}`;
-  node.dataset.id = item.id;
-  node.style.setProperty('--item-x', `${item.x}px`);
-  node.style.setProperty('--item-y', `${item.y}px`);
-  node.style.setProperty('--item-w', `${item.w || 180}px`);
-  node.style.setProperty('--item-h', `${item.h || 120}px`);
-
-  if (item.type === 'frame') {
-    node.innerHTML = `
-      <div class="item-handle" aria-hidden="true"></div>
-      <div class="frame-title" contenteditable="true" data-field="text" spellcheck="false"></div>
-    `;
-  } else {
-    node.innerHTML = `
-      <div class="item-handle" aria-hidden="true"></div>
-      <div class="note-body" contenteditable="true" data-field="text" spellcheck="false"></div>
-    `;
-  }
-
-  const text = node.querySelector('[data-field="text"]');
-  text.textContent = item.text || (item.type === 'frame' ? 'New frame' : 'New note');
-  text.addEventListener('input', () => {
-    const current = state.items.find((entry) => entry.id === item.id);
-    if (current) {
-      current.text = text.textContent.trim() || (current.type === 'frame' ? 'New frame' : 'New note');
-      saveBoard();
-      showHermesReaction('edit', { x: current.x, y: current.y });
-    }
+  const list = Array.isArray(children) ? children : [children];
+  list.forEach((child) => {
+    if (child === null || child === undefined) return;
+    node.append(child instanceof Node ? child : document.createTextNode(text(child)));
   });
-
-  node.addEventListener('pointerdown', onItemPointerDown);
-  node.addEventListener('dblclick', (event) => {
-    event.stopPropagation();
-    text.focus();
-    document.execCommand?.('selectAll', false, null);
-  });
-
   return node;
 }
 
-function renderItems() {
-  els.canvas.querySelectorAll('.board-item').forEach((node) => node.remove());
-  state.items.forEach((item) => els.canvas.appendChild(itemTemplate(item)));
-  updateEmptyState();
+function setStatus(message, isError = false) {
+  els.status.textContent = message;
+  els.status.hidden = false;
+  els.status.dataset.state = isError ? 'error' : 'info';
 }
 
-function addItem(type = 'note', point = centerBoardPoint()) {
-  const item = {
-    id: makeId(),
-    type,
-    x: Math.round(point.x),
-    y: Math.round(point.y),
-    w: type === 'frame' ? 250 : 176,
-    h: type === 'frame' ? 160 : 124,
-    text: type === 'frame' ? 'New frame' : 'New note',
-  };
-  state.items.push(item);
-  saveBoard();
-  renderItems();
-  setStatus(`${type === 'frame' ? 'Frame' : 'Note'} added · drag it`);
-  showHermesReaction(type === 'frame' ? 'frame' : 'note', item);
-
-  const node = els.canvas.querySelector(`[data-id="${item.id}"]`);
-  node?.querySelector('[contenteditable]')?.focus();
-  return item;
+function clear(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
 }
 
-function setTool(tool) {
-  state.activeTool = tool;
-  els.tools.forEach((button) => button.classList.toggle('is-active', button.dataset.tool === tool));
-  setStatus(tool === 'pan' ? 'Drag canvas to pan' : `Tap board to add ${tool}`);
-  showHermesReaction('tool', centerBoardPoint(-36, -20), tool === 'pan' ? 'Pan mode active' : `${tool} tool active`);
+function list(items, ordered = false) {
+  const node = el(ordered ? 'ol' : 'ul');
+  (items || []).forEach((item) => node.append(el('li', { text: text(item.text || item.title || item.label || item) })));
+  return node;
 }
 
-function onToolClick(event) {
-  const tool = event.currentTarget.dataset.tool;
-  setTool(tool);
-  if (tool === 'note') addItem('note', centerBoardPoint(12, 8));
-  if (tool === 'frame') addItem('frame', centerBoardPoint(20, 18));
+function blockShell(block) {
+  return el('section', { class: `report-block block-${text(block.type)}` }, [
+    el('p', { class: 'block-label', text: text(block.type).replaceAll('_', ' ') }),
+    el('h2', { text: text(block.title || block.label || 'Report section') }),
+  ]);
 }
 
-function onCanvasPointerDown(event) {
-  if (event.button !== undefined && event.button !== 0) return;
-  if (event.target.closest('.board-item')) return;
+function renderMetric(block) {
+  const section = blockShell(block);
+  const box = el('div', { class: 'metric-box' }, [
+    el('span', { text: block.label || block.title || 'Metric' }),
+    el('strong', { text: block.value || '' }),
+  ]);
+  if (block.trend?.label) box.append(el('p', { text: block.trend.label }));
+  section.append(box);
+  return section;
+}
 
-  const now = Date.now();
-  const isQuickTap = now - state.lastTapAt < 320;
-  state.lastTapAt = now;
+function renderProgress(block) {
+  const section = blockShell(block);
+  (block.items || [block]).forEach((item) => {
+    const value = Math.max(0, Math.min(100, number(item.value)));
+    section.append(el('div', { class: 'progress-row' }, [
+      el('strong', { text: `${text(item.label || block.label || 'Progress')} — ${value}%` }),
+      el('div', { class: 'progress-track', role: 'img', 'aria-label': `${value}%` }, [el('span', { class: 'progress-fill', style: `width:${value}%` })]),
+      item.detail ? el('p', { text: item.detail }) : null,
+    ]));
+  });
+  return section;
+}
 
-  if (state.activeTool === 'note' || state.activeTool === 'frame' || isQuickTap) {
-    addItem(state.activeTool === 'frame' ? 'frame' : 'note', viewportToBoard(event.clientX, event.clientY));
-    setTool('pan');
-    return;
+function renderTimeline(block) {
+  const section = blockShell(block);
+  const items = el('ol', { class: 'timeline-list' });
+  (block.items || []).forEach((item) => items.append(el('li', { class: 'timeline-item' }, [
+    el('time', { text: item.start || item.end || item.label || item.status || '' }),
+    el('strong', { text: item.title || item.label || '' }),
+    el('p', { text: item.detail || item.owner || item.status || '' }),
+  ])));
+  section.append(items);
+  return section;
+}
+
+function renderGantt(block) {
+  const section = blockShell(block);
+  const columns = block.columns || [];
+  const grid = el('div', { class: 'gantt-grid', style: `grid-template-columns:minmax(110px,1.2fr) repeat(${Math.max(1, columns.length)}, minmax(74px,1fr))` });
+  grid.append(el('div'));
+  columns.forEach((column) => grid.append(el('div', { class: 'block-label', text: column })));
+  (block.lanes || []).forEach((lane) => {
+    grid.append(el('div', { text: lane.label }));
+    const cell = el('div', { style: `grid-column:2/${columns.length + 2}` });
+    (lane.segments || []).forEach((segment) => cell.append(el('div', { class: 'gantt-segment', text: `${segment.label} (${segment.start}–${segment.end})` })));
+    grid.append(cell);
+  });
+  section.append(el('div', { class: 'gantt' }, grid));
+  return section;
+}
+
+function renderKanban(block) {
+  const section = blockShell(block);
+  const kanbanGrid = el('div', { class: 'kanban' });
+  (block.columns || []).forEach((column) => {
+    const col = el('section', { class: 'kanban-column' }, el('h3', { text: column.title }));
+    (column.items || column.cards || []).forEach((card) => col.append(el('article', { class: 'kanban-card' }, [
+      el('strong', { text: card.title || card.label || '' }),
+      card.detail || card.meta ? el('p', { text: card.detail || card.meta }) : null,
+      card.tag ? el('p', { class: 'block-label', text: card.tag }) : null,
+    ])));
+    kanbanGrid.append(col);
+  });
+  section.append(kanbanGrid);
+  return section;
+}
+
+function renderPriorityMatrix(block) {
+  const section = blockShell(block);
+  const grid = el('div', { class: 'matrix' });
+  const quadrants = block.quadrants || (block.items || []).map((item) => ({ title: item.quadrant || item.label, items: [item.label] }));
+  quadrants.forEach((quadrant) => grid.append(el('section', { class: 'matrix-cell' }, [el('h3', { text: quadrant.title || quadrant.key || 'Priority' }), list(quadrant.items || [])])));
+  section.append(grid);
+  return section;
+}
+
+function renderDependencyGraph(block) {
+  const section = blockShell(block);
+  const nodes = new Map((block.nodes || []).map((node) => [node.id, node]));
+  section.append(list(block.nodes || []));
+  (block.edges || []).forEach((edge) => section.append(el('div', { class: 'dependency-edge' }, [
+    el('span', { text: nodes.get(edge.from)?.label || edge.from }),
+    el('b', { text: '→' }),
+    el('span', { text: nodes.get(edge.to)?.label || edge.to }),
+    edge.label ? el('em', { text: edge.label }) : null,
+  ])));
+  return section;
+}
+
+function renderFlow(block) {
+  const section = blockShell(block);
+  const flow = el('ol', { class: 'flow-list' });
+  (block.steps || []).forEach((step) => flow.append(el('li', { class: 'flow-step' }, [el('strong', { text: step.title || step.label || '' }), el('p', { text: step.detail || step.status || '' })])));
+  section.append(flow);
+  return section;
+}
+
+function renderTable(block) {
+  const section = blockShell(block);
+  const table = el('table');
+  const headRow = el('tr');
+  (block.columns || []).forEach((column) => headRow.append(el('th', { text: column })));
+  table.append(el('thead', {}, el('tr', {}, [...headRow.childNodes])));
+  const body = el('tbody');
+  (block.rows || []).forEach((row) => {
+    const values = Array.isArray(row) ? row : [row.label, ...(row.values || [])];
+    body.append(el('tr', {}, values.map((cell) => el('td', { text: cell }))));
+  });
+  table.append(body);
+  section.append(el('div', { class: 'table-wrap' }, table));
+  return section;
+}
+
+function renderChart(block) {
+  const section = blockShell(block);
+  const data = block.data || [];
+  const max = Math.max(1, ...data.map((point) => Math.abs(number(point.value))));
+  const bars = el('div', { class: 'chart-bars' });
+  data.forEach((point) => {
+    const value = number(point.value);
+    bars.append(el('div', { class: 'chart-row' }, [
+      el('span', { text: point.label }),
+      el('span', { class: 'chart-track' }, el('i', { class: 'chart-bar', style: `width:${Math.min(100, Math.abs(value) / max * 100)}%` })),
+      el('b', { text: `${value}${block.valueLabel ? ` ${block.valueLabel}` : ''}` }),
+    ]));
+  });
+  section.append(bars, list(data));
+  return section;
+}
+
+function renderNetwork(block) {
+  const section = blockShell(block);
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 100 100');
+  svg.setAttribute('class', 'static-diagram');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', 'Relationship diagram');
+  const nodes = new Map((block.nodes || []).map((node) => [node.id, node]));
+  (block.edges || []).forEach((edge) => {
+    const from = nodes.get(edge.from) || {};
+    const to = nodes.get(edge.to) || {};
+    const line = document.createElementNS(svg.namespaceURI, 'line');
+    line.setAttribute('x1', number(from.x, 5)); line.setAttribute('y1', number(from.y, 5));
+    line.setAttribute('x2', number(to.x, 95)); line.setAttribute('y2', number(to.y, 95));
+    line.setAttribute('stroke', 'currentColor'); svg.append(line);
+  });
+  (block.nodes || []).forEach((node) => {
+    const group = document.createElementNS(svg.namespaceURI, 'g');
+    const circle = document.createElementNS(svg.namespaceURI, 'circle');
+    circle.setAttribute('cx', number(node.x, 50)); circle.setAttribute('cy', number(node.y, 50)); circle.setAttribute('r', '3'); circle.setAttribute('fill', 'currentColor');
+    const label = document.createElementNS(svg.namespaceURI, 'text');
+    label.setAttribute('x', number(node.x, 50)); label.setAttribute('y', number(node.y, 50) + 8); label.textContent = text(node.label);
+    group.append(circle, label); svg.append(group);
+  });
+  section.append(svg, list(block.edges || []));
+  return section;
+}
+
+function renderScene(block) {
+  const section = blockShell(block);
+  const map = el('div', { class: 'scene-map', role: 'img', 'aria-label': 'Spatial layout' });
+  (block.objects || []).forEach((object) => {
+    const position = object.position || [0, 0, 0];
+    map.append(el('span', { class: 'scene-object', style: `left:${50 + number(position[0]) * 8}%;top:${50 - number(position[1]) * 8}%`, text: object.label }));
+  });
+  section.append(map, list((block.objects || []).map((object) => `${object.label}: position ${(object.position || []).join(', ')}`)));
+  return section;
+}
+
+function renderDetails(block) {
+  const section = blockShell(block);
+  (block.sections || []).forEach((part) => section.append(el('details', { open: true }, [el('summary', { text: part.title }), list(part.items || part.content || [])])));
+  return section;
+}
+
+function renderMarkdown(block) {
+  const section = blockShell(block);
+  section.append(el('pre', { text: block.markdown || block.text || block.code || '' }));
+  return section;
+}
+
+function renderInsightCards(block) {
+  const section = blockShell(block);
+  (block.items || []).forEach((item) => section.append(el('p', {}, [el('strong', { text: item.label || item.value || '' }), document.createTextNode(item.detail ? ` — ${item.detail}` : '')])));
+  return section;
+}
+
+function renderBlock(block) {
+  const type = text(block.type).toLowerCase();
+  if (!SUPPORTED_TYPES.has(type)) return renderMarkdown({ ...block, title: block.title || type, text: JSON.stringify(block, null, 2) });
+  if (type === 'metric') return renderMetric(block);
+  if (type === 'progress') return renderProgress(block);
+  if (type === 'timeline') return renderTimeline(block);
+  if (type === 'gantt') return renderGantt(block);
+  if (type === 'kanban') return renderKanban(block);
+  if (type === 'priority_matrix') return renderPriorityMatrix(block);
+  if (type === 'dependency_graph') return renderDependencyGraph(block);
+  if (type === 'flow' || type === 'flowchart' || type === 'sequence') return renderFlow({ ...block, steps: block.steps || block.items });
+  if (type === 'comparison_table') return renderTable(block);
+  if (type === 'chart') return renderChart(block);
+  if (type === 'canvas_network') return renderNetwork(block);
+  if (type === 'three_scene') return renderScene(block);
+  if (type === 'details') return renderDetails(block);
+  if (type === 'key_points' || type === 'checklist') { const section = blockShell(block); section.append(list(block.items || [])); return section; }
+  if (type === 'insight_cards') return renderInsightCards(block);
+  if (type === 'callout') { const section = blockShell(block); section.append(el('p', { class: 'callout', text: block.text || '' })); return section; }
+  return renderMarkdown(block);
+}
+
+function renderReport(payload) {
+  const report = payload.report || payload;
+  const plan = report.plan || {};
+  clear(els.report);
+  els.title.textContent = plan.title || 'Latest report';
+  const header = el('header', { class: 'report-header' }, [
+    el('p', { class: 'kicker', text: 'Latest generated report' }),
+    el('h1', { class: 'report-title', text: plan.title || 'Untitled report' }),
+    el('p', { class: 'summary', text: plan.summary || '' }),
+    el('p', { class: 'meta', text: [report.generated_at, report.context?.topic, report.context?.thread_id].filter(Boolean).join(' · ') }),
+  ]);
+  const metrics = el('div', { class: 'metrics' });
+  (plan.metrics || []).forEach((metric) => metrics.append(el('div', { class: 'metric-box' }, [el('span', { text: metric.label }), el('strong', { text: metric.value })])));
+  if (metrics.childNodes.length) header.append(metrics);
+  els.report.append(header);
+  (plan.blocks || []).forEach((block) => els.report.append(renderBlock(block)));
+  if (report.source?.text) {
+    els.report.append(el('section', { class: 'report-block' }, [el('h2', { text: 'Source response' }), el('pre', { class: 'source-text', text: report.source.text })]));
   }
-
-  state.pointer = {
-    mode: 'pan',
-    id: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    panX: state.panX,
-    panY: state.panY,
-  };
-  els.canvas.classList.add('is-dragging');
-  els.canvas.setPointerCapture?.(event.pointerId);
-}
-
-function onPointerMove(event) {
-  if (!state.pointer || state.pointer.id !== event.pointerId) return;
-
-  if (state.pointer.mode === 'item') {
-    const dx = (event.clientX - state.pointer.startX) / state.zoom;
-    const dy = (event.clientY - state.pointer.startY) / state.zoom;
-    const item = state.items.find((entry) => entry.id === state.pointer.itemId);
-    if (!item) return;
-    item.x = Math.round(state.pointer.x + dx);
-    item.y = Math.round(state.pointer.y + dy);
-    state.pointer.node.style.setProperty('--item-x', `${item.x}px`);
-    state.pointer.node.style.setProperty('--item-y', `${item.y}px`);
-    return;
-  }
-
-  state.panX = state.pointer.panX + event.clientX - state.pointer.startX;
-  state.panY = state.pointer.panY + event.clientY - state.pointer.startY;
-  setBoardTransform();
-}
-
-function stopPointer(event) {
-  if (!state.pointer || state.pointer.id !== event.pointerId) return;
-  if (state.pointer.mode === 'item') {
-    state.pointer.node.classList.remove('is-moving');
-    state.pointer.node.releasePointerCapture?.(event.pointerId);
-    saveBoard();
-    setStatus('Object moved');
-    const item = state.items.find((entry) => entry.id === state.pointer.itemId);
-    showHermesReaction('move', item || centerBoardPoint());
-  } else {
-    els.canvas.releasePointerCapture?.(event.pointerId);
-    els.canvas.classList.remove('is-dragging');
-  }
-  state.pointer = null;
-}
-
-function onItemPointerDown(event) {
-  if (event.button !== undefined && event.button !== 0) return;
-  if (event.target.matches('[contenteditable]')) return;
-  event.stopPropagation();
-  const node = event.currentTarget;
-  const item = state.items.find((entry) => entry.id === node.dataset.id);
-  if (!item) return;
-
-  state.pointer = {
-    mode: 'item',
-    id: event.pointerId,
-    itemId: item.id,
-    node,
-    startX: event.clientX,
-    startY: event.clientY,
-    x: item.x,
-    y: item.y,
-  };
-  node.classList.add('is-moving');
-  node.setPointerCapture?.(event.pointerId);
-}
-
-function onWheel(event) {
-  event.preventDefault();
-  const direction = event.deltaY > 0 ? -1 : 1;
-  const next = Math.min(1.8, Math.max(0.45, state.zoom + direction * 0.05));
-  state.zoom = Number(next.toFixed(2));
-  setBoardTransform();
-}
-
-function clearBoard() {
-  state.items = [];
-  saveBoard();
-  renderItems();
-  setTool('pan');
-  setStatus('Board cleared');
-  showHermesReaction('clear', centerBoardPoint());
-}
-
-function applyTelegramTheme() {
-  const tg = window.Telegram?.WebApp;
-  if (!tg) {
-    els.telegramStatus.textContent = 'Browser mode';
-    return;
-  }
-
-  tg.ready();
-  tg.expand();
-  els.telegramStatus.textContent = tg.platform ? `Telegram · ${tg.platform}` : 'Telegram WebApp';
-
-  const accent = tg.themeParams?.button_color;
-  if (accent) document.documentElement.style.setProperty('--accent', accent);
-
-  tg.MainButton?.setText('Add note');
-  tg.MainButton?.show();
-  tg.MainButton?.onClick(() => addItem('note', centerBoardPoint(12, 8)));
-  if (tg.isVersionAtLeast?.('6.1')) {
-    tg.BackButton?.show();
-    tg.BackButton?.onClick(clearBoard);
-  }
-}
-
-function renderConfig(config) {
-  if (config?.app_name) els.title.textContent = config.app_name;
-  if (config?.description) els.subtitle.textContent = config.description;
-  if (config?.accent) document.documentElement.style.setProperty('--accent', config.accent);
+  els.report.hidden = false;
+  els.status.hidden = true;
+  window.__hermesReportReady = true;
 }
 
 async function loadConfig() {
-  const configUrl = els.root?.dataset.configUrl || '/miniapp/config.json';
-  const response = await fetch(configUrl);
-  if (!response.ok) throw new Error(`config HTTP ${response.status}`);
+  const response = await fetch(state.configUrl, { cache: 'no-store' });
+  if (!response.ok) return;
   const config = await response.json();
-  renderConfig(config);
-  if (config?.endpoints?.board) state.boardEndpoint = config.endpoints.board;
+  if (config?.endpoints?.report_latest) state.endpoint = config.endpoints.report_latest;
 }
 
-els.tools.forEach((button) => button.addEventListener('click', onToolClick));
-els.canvas.addEventListener('pointerdown', onCanvasPointerDown);
-els.canvas.addEventListener('pointermove', onPointerMove);
-els.canvas.addEventListener('pointerup', stopPointer);
-els.canvas.addEventListener('pointercancel', stopPointer);
-els.canvas.addEventListener('wheel', onWheel, { passive: false });
-
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'n' && !event.metaKey && !event.ctrlKey) addItem('note', centerBoardPoint(12, 8));
-  if (event.key === 'f' && !event.metaKey && !event.ctrlKey) addItem('frame', centerBoardPoint(18, 18));
-  if (event.key === '0') {
-    state.panX = 0;
-    state.panY = 0;
-    state.zoom = 1;
-    setBoardTransform();
-    setStatus('View reset');
+async function loadReport() {
+  setStatus('Loading latest report.');
+  els.report.hidden = true;
+  try {
+    await loadConfig();
+    const response = await fetch(state.endpoint, { cache: 'no-store' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.success === false) {
+      setStatus(payload.error || 'No report is available yet.', response.status >= 500);
+      return;
+    }
+    renderReport(payload);
+  } catch (error) {
+    setStatus(`Could not load report: ${error.message}`, true);
   }
-});
+}
 
-loadBoard();
-renderItems();
-setBoardTransform();
-window.__hermesMiniappReady = true;
-loadConfig()
-  .catch(() => {})
-  .finally(() => {
-    applyTelegramTheme();
-    fetchRemoteBoard(false).catch(() => {});
-    setInterval(() => fetchRemoteBoard(true).catch(() => {}), 1800);
-  });
+function boot() {
+  window.__hermesMiniappReady = true;
+  const tg = window.Telegram?.WebApp;
+  tg?.ready?.();
+  tg?.expand?.();
+  els.refresh?.addEventListener('click', loadReport);
+  els.close?.addEventListener('click', () => tg?.close?.());
+  loadReport();
+}
+
+document.addEventListener('DOMContentLoaded', boot);

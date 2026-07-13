@@ -90,6 +90,7 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
+from gateway import visual_report_store
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
@@ -825,7 +826,7 @@ _MINIAPP_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-XSS-Protection": "0",
     "Referrer-Policy": "no-referrer",
-    "Cache-Control": "no-store, max-age=0",
+    "Cache-Control": "no-store",
     "Pragma": "no-cache",
 }
 
@@ -834,15 +835,27 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def security_headers_middleware(request, handler):
         """Add security headers to all responses (including errors)."""
-        response = await handler(request)
-        headers = _MINIAPP_SECURITY_HEADERS if request.path.startswith("/miniapp") else _SECURITY_HEADERS
-        if request.path.startswith("/miniapp"):
+        raw_path = getattr(request, "raw_path", "") or ""
+        raw_path_lower = raw_path.lower()
+        if raw_path_lower.startswith("/miniapp/assets/") and (
+            ".." in raw_path_lower
+            or "%2e" in raw_path_lower
+            or "%2f" in raw_path_lower
+            or "%5c" in raw_path_lower
+        ):
+            response = web.Response(status=403, text="asset path escapes miniapp static root")
+        else:
+            response = await handler(request)
+
+        is_miniapp = request.path.startswith("/miniapp")
+        headers = _MINIAPP_SECURITY_HEADERS if is_miniapp else _SECURITY_HEADERS
+        if is_miniapp:
             response.headers.pop("X-Frame-Options", None)
-        for k, v in headers.items():
-            if request.path.startswith("/miniapp"):
-                response.headers[k] = v
+        for key, value in headers.items():
+            if is_miniapp:
+                response.headers[key] = value
             else:
-                response.headers.setdefault(k, v)
+                response.headers.setdefault(key, value)
         return response
 else:
     security_headers_middleware = None  # type: ignore[assignment]
@@ -1023,6 +1036,8 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         self._miniapp_config: Dict[str, Any] = self._normalize_miniapp_config(extra.get("miniapp"))
         self._miniapp_static_dir: Path = self._resolve_miniapp_static_dir(self._miniapp_config.get("static_dir"))
+        raw_miniapp = extra.get("miniapp") if isinstance(extra.get("miniapp"), dict) else {}
+        self._miniapp_extra: Dict[str, Any] = dict(raw_miniapp or {})
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1382,6 +1397,124 @@ class APIServerAdapter(BasePlatformAdapter):
         ctx = self._request_audit_context(request)
         fields = [f"{key}={value!r}" for key, value in ctx.items() if value]
         return " ".join(fields) if fields else "source='unknown'"
+
+    # ------------------------------------------------------------------
+    # Public Hermes miniapp routes
+    # ------------------------------------------------------------------
+
+    _MINIAPP_CACHE_HEADERS = {
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    _MINIAPP_CSP = (
+        "default-src 'self'; "
+        "base-uri 'none'; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "img-src 'self' data: blob:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' https://telegram.org; "
+        "connect-src 'self'; "
+        "font-src 'self' data:; "
+        "media-src 'none'; "
+        "form-action 'none'"
+    )
+
+    @staticmethod
+    def _miniapp_response_headers(*, content_type: str | None = None) -> Dict[str, str]:
+        headers = dict(APIServerAdapter._MINIAPP_CACHE_HEADERS)
+        headers["Content-Security-Policy"] = APIServerAdapter._MINIAPP_CSP
+        headers["X-Content-Type-Options"] = "nosniff"
+        headers["Referrer-Policy"] = "no-referrer"
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
+
+    def _miniapp_static_root(self) -> Path:
+        configured = self._miniapp_extra.get("static_dir")
+        if configured:
+            try:
+                return Path(str(configured)).expanduser().resolve(strict=False)
+            except Exception:
+                logger.warning("[%s] Invalid miniapp static_dir ignored: %r", self.name, configured)
+        return (Path(__file__).resolve().parents[1] / "miniapp").resolve(strict=False)
+
+    @staticmethod
+    def _safe_resolve_relative(root: Path, relative_path: str) -> Optional[Path]:
+        rel = str(relative_path or "").replace("\\", "/").lstrip("/")
+        if not rel or "\x00" in rel:
+            return None
+        root_resolved = root.resolve(strict=False)
+        candidate = (root_resolved / rel).resolve(strict=False)
+        try:
+            candidate.relative_to(root_resolved)
+        except ValueError:
+            return None
+        return candidate
+
+    def _miniapp_shell_path(self) -> Optional[Path]:
+        return self._safe_resolve_relative(self._miniapp_static_root(), "index.html")
+
+    def _miniapp_asset_path(self, raw_path: str) -> Optional[Path]:
+        return self._safe_resolve_relative(self._miniapp_static_root() / "assets", raw_path)
+
+    def _browser_safe_miniapp_config(self) -> Dict[str, Any]:
+        safe: Dict[str, Any] = {
+            "app_name": "Hermes Report",
+            "description": "Latest generated Hermes report",
+            "accent": "#111111",
+            "endpoints": {
+                "report_latest": "/miniapp/api/report/latest",
+            },
+        }
+        for key in ("app_name", "description", "accent"):
+            value = self._miniapp_extra.get(key)
+            if isinstance(value, str) and value.strip():
+                safe[key] = value.strip()[:160]
+        return safe
+
+    async def _handle_miniapp_shell(self, request: "web.Request") -> "web.StreamResponse":
+        path = self._miniapp_shell_path()
+        if not path or not path.is_file():
+            raise web.HTTPNotFound(text="miniapp shell not found")
+        return web.FileResponse(
+            path,
+            headers=self._miniapp_response_headers(content_type="text/html; charset=utf-8"),
+        )
+
+    async def _handle_miniapp_config(self, request: "web.Request") -> "web.Response":
+        return web.json_response(
+            self._browser_safe_miniapp_config(),
+            headers=self._miniapp_response_headers(),
+        )
+
+    async def _handle_miniapp_latest_report(self, request: "web.Request") -> "web.Response":
+        payload = visual_report_store.load_latest_report()
+        if payload is None:
+            return web.json_response(
+                {"success": False, "error": "No report has been generated yet", "report": None},
+                status=404,
+                headers=self._miniapp_response_headers(),
+            )
+        return web.json_response({"success": True, "report": payload}, headers=self._miniapp_response_headers())
+
+    async def _handle_miniapp_asset(self, request: "web.Request") -> "web.StreamResponse":
+        raw_path = request.match_info.get("path", "")
+        path = self._miniapp_asset_path(raw_path)
+        if path is None:
+            raise web.HTTPForbidden(text="asset path escapes miniapp static root")
+        if not path.is_file():
+            raise web.HTTPNotFound(text="miniapp asset not found")
+        return web.FileResponse(path, headers=self._miniapp_response_headers())
+
+    def _register_miniapp_routes(self, app: "web.Application") -> None:
+        app.router.add_get("/miniapp", self._handle_miniapp_shell)
+        app.router.add_get("/miniapp/", self._handle_miniapp_shell)
+        app.router.add_get("/miniapp/index.html", self._handle_miniapp_shell)
+        app.router.add_get("/miniapp/config.json", self._handle_miniapp_config)
+        app.router.add_get("/miniapp/api/report/latest", self._handle_miniapp_latest_report)
+        app.router.add_get("/miniapp/assets/{path:.*}", self._handle_miniapp_asset)
 
     def _cron_origin_from_request(self, request: "web.Request") -> Dict[str, str]:
         """Persist safe API source metadata on cron jobs created over HTTP."""

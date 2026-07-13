@@ -969,7 +969,7 @@ class TestModelsEndpoint:
 
 class TestMiniappEndpoint:
     @pytest.mark.asyncio
-    async def test_miniapp_index_serves_figma_like_board_shell(self, adapter):
+    async def test_miniapp_index_serves_report_reader_shell(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.get("/miniapp")
@@ -982,12 +982,11 @@ class TestMiniappEndpoint:
             assert "X-Frame-Options" not in resp.headers
             text = await resp.text()
 
-        assert "Hermes Board" in text
+        assert "Hermes Report" in text
         assert "telegram-web-app.js" in text
         assert "/miniapp/config.json" in text
-        assert "collaboration-board" in text
-        assert "board-canvas" in text
-        assert "dotted-grid" in text
+        assert "report-app" in text
+        assert "collaboration-board" not in text
         assert "/v1/runs" not in text
         assert "Run Hermes" not in text
 
@@ -999,35 +998,21 @@ class TestMiniappEndpoint:
             assert resp.status == 200
             data = await resp.json()
 
-        assert data["app_name"] == "Hermes Board"
-        assert data["api_base"] == "/v1"
-        assert data["endpoints"]["runs"] == "/v1/runs"
-        assert data["endpoints"]["board"] == "/miniapp/api/board"
-        assert data["telegram"]["web_app_ready"] is True
-        assert data["board"]["mode"] == "collaboration"
+        assert data["app_name"] == "Hermes Report"
+        assert data["endpoints"] == {"report_latest": "/miniapp/api/report/latest"}
 
     @pytest.mark.asyncio
-    async def test_miniapp_board_api_shares_canvas_state(self, adapter, tmp_path, monkeypatch):
+    async def test_miniapp_board_api_is_not_registered(self, adapter, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            created = await cli.post(
+            response = await cli.post(
                 "/miniapp/api/board",
                 json={"action": "create", "type": "note", "text": "Hello Aidyn", "x": 12, "y": -4},
             )
-            assert created.status == 200
-            created_data = await created.json()
-            item = created_data["board"]["items"][0]
-            assert item["text"] == "Hello Aidyn"
-            assert item["x"] == 12
+            assert response.status == 404
 
-            fetched = await cli.get("/miniapp/api/board")
-            assert fetched.status == 200
-            fetched_data = await fetched.json()
-
-        assert fetched_data["board"]["revision"] == created_data["board"]["revision"]
-        assert fetched_data["board"]["items"][0]["id"] == item["id"]
-        assert (tmp_path / "gateway" / "miniapp_board.json").exists()
+        assert not (tmp_path / "gateway" / "miniapp_board.json").exists()
 
     @pytest.mark.asyncio
     async def test_miniapp_can_serve_custom_static_dir(self, tmp_path):

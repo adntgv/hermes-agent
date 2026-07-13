@@ -1,0 +1,135 @@
+{
+  "version": "visual-report-registry/v1",
+  "components": [
+    {
+      "type": "metric",
+      "label": "Metric",
+      "description": "Single headline number or compact fact with optional trend.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Headline metric and trend text are exposed as readable text.",
+      "dataShape": "{ id, type: 'metric', title, accessibilityLabel, label, value, trend?: { direction: 'up'|'down'|'flat', label } }",
+      "selectionGuidance": "Use for exact values, counts, dates, states, owners, or short facts explicitly present in the source; never estimate missing numbers."
+    },
+    {
+      "type": "progress",
+      "label": "Progress",
+      "description": "Progress bar with numeric value and optional segment counts.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Progress value is exposed with native progress semantics and text labels.",
+      "dataShape": "{ id, type: 'progress', title, accessibilityLabel, value, max, label, segments?: [{ label, value }] }",
+      "selectionGuidance": "Use only when the source provides grounded completion, quota, percentage, or count-over-total values."
+    },
+    {
+      "type": "timeline",
+      "label": "Timeline",
+      "description": "Linear dated milestones with status and optional owner.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Milestones are presented as an ordered list with dates and status.",
+      "dataShape": "{ id, type: 'timeline', title, accessibilityLabel, items: [{ id, label, start, end?, status: 'todo'|'active'|'blocked'|'done', owner? }] }",
+      "selectionGuidance": "Use when chronology, milestones, deadlines, or ordered dated events are central to understanding."
+    },
+    {
+      "type": "gantt",
+      "label": "Gantt",
+      "description": "Lane-based schedule bars across a start/end date range.",
+      "rendererMode": "rich",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Schedule bars are paired with readable labels, lanes, and dates.",
+      "dataShape": "{ id, type: 'gantt', title, accessibilityLabel, start, end, items: [{ id, label, start, end?, status, owner?, lane }] }",
+      "selectionGuidance": "Use for project work distributed over time, parallel lanes, phases, or sequencing with durations."
+    },
+    {
+      "type": "kanban",
+      "label": "Kanban",
+      "description": "Column-based board of cards grouped by state or category.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Cards are grouped under native section headings that remain readable without JavaScript.",
+      "dataShape": "{ id, type: 'kanban', title, accessibilityLabel, columns: [{ id, title, cards: [{ id, title, meta? }] }] }",
+      "selectionGuidance": "Use when items are best understood by status, queue, ownership bucket, or workflow state."
+    },
+    {
+      "type": "priority_matrix",
+      "label": "Priority matrix",
+      "description": "Impact/effort or urgency/importance scatter matrix using normalized x/y positions.",
+      "rendererMode": "rich",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Items are positioned by normalized priority axes and listed in text fallback.",
+      "dataShape": "{ id, type: 'priority_matrix', title, accessibilityLabel, xLabel, yLabel, items: [{ id, label, x, y, quadrant? }] }",
+      "selectionGuidance": "Use when tradeoffs, prioritization, impact versus effort, or urgency versus importance are explicit."
+    },
+    {
+      "type": "dependency_graph",
+      "label": "Dependency graph",
+      "description": "Nodes and directed edges showing prerequisites or unblock relationships.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Graph is backed by an accessible adjacency list of dependency edges.",
+      "dataShape": "{ id, type: 'dependency_graph', title, accessibilityLabel, nodes: [{ id, label, group? }], edges: [{ from, to, label? }] }",
+      "selectionGuidance": "Use when prerequisites, blockers, ownership handoffs, or cause-and-effect relationships matter."
+    },
+    {
+      "type": "flow",
+      "label": "Flow",
+      "description": "Ordered process steps with optional detail per step.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Process is exposed as numbered flow steps with supporting details.",
+      "dataShape": "{ id, type: 'flow', title, accessibilityLabel, steps: [{ id, label, detail? }] }",
+      "selectionGuidance": "Use for procedures, decision flows, pipelines, handoff sequences, or causal step-by-step explanations."
+    },
+    {
+      "type": "comparison_table",
+      "label": "Comparison table",
+      "description": "Responsive matrix comparing options by columns and rows.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Native table uses column and row headers for screen-reader navigation.",
+      "dataShape": "{ id, type: 'comparison_table', title, accessibilityLabel, columns: [string], rows: [{ id, label, values: [string] }] }",
+      "selectionGuidance": "Use when options, tradeoffs, alternatives, or before/after states need side-by-side comparison."
+    },
+    {
+      "type": "chart",
+      "label": "Chart",
+      "description": "Mobile-legible SVG bar, line, area, or donut chart.",
+      "rendererMode": "rich",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "SVG chart is backed by a visible data list for non-visual access.",
+      "dataShape": "{ id, type: 'chart', title, accessibilityLabel, kind: 'bar'|'line'|'area'|'donut', data: [{ label, value, series? }], valueLabel? }",
+      "selectionGuidance": "Use for explicit numeric distributions, trends, proportions, or series in the source; do not invent data."
+    },
+    {
+      "type": "canvas_network",
+      "label": "Canvas network",
+      "description": "Canvas-rendered static network with node coordinates and fallback list.",
+      "rendererMode": "rich",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Canvas diagram includes a static edge list fallback for accessibility.",
+      "dataShape": "{ id, type: 'canvas_network', title, accessibilityLabel, nodes: [{ id, label, group?, x, y }], edges: [{ from, to, label? }] }",
+      "selectionGuidance": "Use for dense relationship maps when approximate placement communicates clusters better than a simple list."
+    },
+    {
+      "type": "three_scene",
+      "label": "Three scene",
+      "description": "React Three Fiber scene with objects in 3D space and WebGL fallback.",
+      "rendererMode": "rich",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Three-dimensional objects are described in a text fallback when WebGL is unavailable.",
+      "dataShape": "{ id, type: 'three_scene', title, accessibilityLabel, objects: [{ id, label, size, position: [x, y, z] }] }",
+      "selectionGuidance": "Use sparingly for spatial concepts, layered systems, or dimensional metaphors that benefit from 3D placement."
+    },
+    {
+      "type": "details",
+      "label": "Details",
+      "description": "Accessible expandable sections for lossless supporting detail.",
+      "rendererMode": "telegram-fallback",
+      "supportsTelegramFallback": true,
+      "accessibilitySummary": "Native details sections preserve full task text and supporting evidence.",
+      "dataShape": "{ id, type: 'details', title, accessibilityLabel, sections: [{ id, title, content: [string] }] }",
+      "selectionGuidance": "Use to preserve exact tasks, evidence, caveats, commands, or source details that would otherwise be lost."
+    }
+  ]
+}
