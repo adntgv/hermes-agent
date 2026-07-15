@@ -130,6 +130,7 @@ def test_long_response_config_parses_visual_digest(monkeypatch):
     assert cfg["visual_digest"]["enabled"] is True
     assert cfg["visual_digest"]["caption"] == "digest caption"
     assert cfg["visual_digest"]["send_raw_html"] is False
+    assert cfg["visual_digest"]["link_text"] == "Open visual report"
     assert cfg["hosting"] == {
         "enabled": True,
         "endpoint_url": "https://objects.example.test",
@@ -176,6 +177,47 @@ async def test_long_response_delivery_returns_hosted_link_without_attachment(mon
 
     assert result == "[Open full response](https://reports.example.test/long-responses/token/index.html)"
     runner._host_long_response_html.assert_awaited_once()
+    adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_long_response_delivery_hosts_visual_digest_instead_of_wrapped_markdown(monkeypatch, tmp_path):
+    runner = _runner()
+    runner._plan_visual_digest = AsyncMock(return_value=SAMPLE_PLAN)
+    runner._host_long_response_html = AsyncMock(
+        return_value="https://reports.example.test/long-responses/visual-token/index.html"
+    )
+    adapter = SimpleNamespace(send_document=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    monkeypatch.setattr(long_html, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        run_mod,
+        "_load_gateway_config",
+        lambda: {
+            "telegram": {
+                "long_response_html": {
+                    "enabled": True,
+                    "threshold_chars": 10,
+                    "threshold_lines": 2,
+                    "visual_digest": {
+                        "enabled": True,
+                        "link_text": "Open visual report",
+                        "send_raw_html": False,
+                    },
+                    "hosting": {
+                        "enabled": True,
+                        "fallback_to_attachment": True,
+                    },
+                }
+            }
+        },
+    )
+
+    result = await runner._maybe_deliver_long_telegram_response_as_html(_event(), SAMPLE_RESPONSE)
+
+    assert result == "[Open visual report](https://reports.example.test/long-responses/visual-token/index.html)"
+    hosted_path = runner._host_long_response_html.await_args.args[0]
+    assert hosted_path.endswith("-visual.html")
     adapter.send_document.assert_not_awaited()
 
 

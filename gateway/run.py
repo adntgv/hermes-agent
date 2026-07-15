@@ -14641,6 +14641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "enabled": bool(visual_raw.get("enabled", False)),
                 "caption": str(visual_raw.get("caption") or "Visual digest attached as HTML."),
                 "send_raw_html": bool(visual_raw.get("send_raw_html", True)),
+                "link_text": str(visual_raw.get("link_text") or "Open visual report"),
             },
             "hosting": {
                 "enabled": bool(hosting_raw.get("enabled", False)),
@@ -14885,6 +14886,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ts, _, _ = self._long_response_html_paths(event)
             sent_docs = 0
             visual_cfg = cfg.get("visual_digest") if isinstance(cfg.get("visual_digest"), dict) else {}
+            hosting_cfg = cfg.get("hosting") if isinstance(cfg.get("hosting"), dict) else {}
             visual_attempted = False
             visual_sent = False
             if visual_cfg.get("enabled") and adapter and hasattr(adapter, "send_document"):
@@ -14896,6 +14898,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("Telegram long-response visual planner failed: %s", exc, exc_info=True)
                 if plan:
                     visual_path = self._write_visual_digest_html_file(response, event, plan=plan, ts=ts)
+                    if hosting_cfg.get("enabled"):
+                        hosted_visual_url = await self._host_long_response_html(visual_path, hosting_cfg)
+                        if hosted_visual_url:
+                            link_text = str(visual_cfg.get("link_text") or "Open visual report")
+                            link_text = link_text.replace("[", "").replace("]", "")
+                            return f"[{link_text}]({hosted_visual_url})"
                     visual_result = await adapter.send_document(
                         chat_id=event.source.chat_id,
                         file_path=visual_path,
@@ -14913,7 +14921,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.info("Telegram long-response visual planner returned no usable plan; skipping visual digest")
             if sent_docs == 0 or visual_cfg.get("send_raw_html", True):
                 html_path = self._write_long_response_html_file(response, event, ts=ts)
-                hosting_cfg = cfg.get("hosting") if isinstance(cfg.get("hosting"), dict) else {}
                 if hosting_cfg.get("enabled"):
                     hosted_url = await self._host_long_response_html(html_path, hosting_cfg)
                     if hosted_url:
