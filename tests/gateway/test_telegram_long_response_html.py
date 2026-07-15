@@ -707,6 +707,42 @@ def test_write_visual_digest_html_file_renders_representation_first_blocks(monke
     assert "<section class=\"panel full-body\">" not in html_doc
 
 
+def test_visual_digest_mobile_layout_contains_content_and_stacks_tables(monkeypatch, tmp_path):
+    runner = _runner()
+    monkeypatch.setattr(long_html, "get_hermes_home", lambda: tmp_path)
+    plan = long_html.normalize_visual_digest_plan({
+        "title": "Mobile repair guide",
+        "summary": "A narrow-screen report must not let tables or step text widen the page.",
+        "blocks": [
+            {
+                "type": "comparison_table",
+                "title": "Choose a repair",
+                "columns": ["Option", "Verdict", "Role"],
+                "rows": [["Repair plate", "Best", "Carries the load"]],
+            },
+            {
+                "type": "sequence",
+                "title": "Install",
+                "steps": [{"title": "Attach the mounting plate", "detail": "Use the intact board around the damaged holes."}],
+            },
+        ],
+    }, SAMPLE_RESPONSE)
+
+    path = runner._write_visual_digest_html_file(SAMPLE_RESPONSE, _event(), plan=plan, ts="20260715T000000Z")
+    html_doc = open(path, encoding="utf-8").read()
+
+    assert 'data-label="Option"' in html_doc
+    assert 'data-label="Verdict"' in html_doc
+    assert 'data-label="Role"' in html_doc
+    assert "main{width:100%;max-width:1100px;min-width:0" in html_doc
+    assert ".hero,.panel,.full-body{min-width:0;max-width:100%" in html_doc
+    assert "overflow-wrap:anywhere" in html_doc
+    assert "@media (max-width:600px)" in html_doc
+    assert ".table-wrap thead{display:none}" in html_doc
+    assert ".table-wrap td:before{content:attr(data-label)" in html_doc
+    assert ".process li{grid-template-columns:36px minmax(0,1fr)" in html_doc
+
+
 def test_visual_planner_prompt_requires_representation_before_layout():
     runner = _runner()
     messages = runner._build_visual_digest_planner_messages(_event(), SAMPLE_RESPONSE)
