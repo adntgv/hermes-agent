@@ -13,6 +13,7 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
 """
 
 from typing import Any
+from urllib.parse import urlparse
 
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -20,6 +21,12 @@ from providers.base import ProviderProfile
 
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
+
+    @staticmethod
+    def _is_alem_qwen(*, model: str | None, base_url: str | None) -> bool:
+        """Return whether this call targets Alem's LiteLLM-backed Qwen route."""
+        hostname = (urlparse(str(base_url or "")).hostname or "").lower()
+        return hostname == "llm.alem.ai" and str(model or "").lower().startswith("qwen")
 
     def build_api_kwargs_extras(
         self,
@@ -36,6 +43,16 @@ class CustomProfile(ProviderProfile):
             options = extra_body.get("options", {})
             options["num_ctx"] = ollama_num_ctx
             extra_body["options"] = options
+
+        # Alem exposes Qwen through a LiteLLM OpenAI-compatible route that
+        # rejects both reasoning_effort and Ollama's think field. Keep the
+        # provider generic everywhere else, but omit unsupported controls for
+        # this known endpoint even when the parent profile selects an effort.
+        if self._is_alem_qwen(
+            model=ctx.get("model"),
+            base_url=ctx.get("base_url"),
+        ):
+            return extra_body, top_level
 
         # Reasoning / thinking control for custom OpenAI-compatible endpoints
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).
