@@ -623,6 +623,30 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+    @pytest.mark.asyncio
+    async def test_ainvoke_hook_awaits_callbacks_in_registration_order_and_fails_open(self):
+        manager = PluginManager()
+        calls = []
+
+        def first(**kwargs):
+            calls.append(("first", kwargs["marker"]))
+            return "one"
+
+        async def second(**kwargs):
+            calls.append(("second", kwargs["marker"]))
+            return "two"
+
+        def broken(**kwargs):
+            calls.append(("broken", kwargs["marker"]))
+            raise RuntimeError("broken plugin")
+
+        manager._hooks["post_gateway_auth_dispatch"] = [first, second, broken]
+
+        assert await manager.ainvoke_hook(
+            "post_gateway_auth_dispatch", marker="x"
+        ) == ["one", "two"]
+        assert calls == [("first", "x"), ("second", "x"), ("broken", "x")]
+
     def test_valid_hooks_include_request_scoped_api_hooks(self):
         assert "pre_api_request" in VALID_HOOKS
         assert "post_api_request" in VALID_HOOKS
