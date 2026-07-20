@@ -9057,25 +9057,6 @@ class TelegramAdapter(BasePlatformAdapter):
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
         )
 
-        if chat_type == "group" and thread_id_str:
-            try:
-                from gateway.telegram_topics import TelegramTopicRegistry
-
-                TelegramTopicRegistry().record_message(
-                    chat_id=str(chat.id),
-                    thread_id=thread_id_str,
-                    chat_title=chat.title or None,
-                    topic_title=chat_topic,
-                    message_id=str(message.message_id),
-                    auto_skill=topic_skill,
-                )
-            except Exception:
-                logger.debug(
-                    "[%s] Failed to record Telegram group topic metadata",
-                    getattr(self, "name", "telegram"),
-                    exc_info=True,
-                )
-
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)
         # so a user replying to a single selected substring of a prior

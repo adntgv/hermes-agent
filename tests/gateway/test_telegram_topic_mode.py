@@ -293,29 +293,6 @@ async def test_telegram_group_prompt_is_not_topic_lobby_even_when_dm_topic_mode_
 
 
 @pytest.mark.asyncio
-async def test_topic_command_in_group_manages_group_memory_without_enabling_dm_topic_mode(
-    tmp_path, monkeypatch
-):
-    import gateway.run as gateway_run
-
-    session_db = SessionDB(db_path=tmp_path / "state.db")
-    runner = _make_runner(session_db=session_db)
-    runner._run_agent = AsyncMock(
-        side_effect=AssertionError("group /topic must not enter the agent loop")
-    )
-
-    monkeypatch.setattr(
-        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
-    )
-
-    result = await runner._handle_message(_make_group_event("/topic", thread_id="555"))
-
-    assert "Telegram topic: Topic 555 (`555`)" in result
-    assert session_db.is_telegram_topic_mode_enabled(chat_id="-100123", user_id="208214988") is False
-    runner._run_agent.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_group_new_keeps_existing_reset_semantics_when_dm_topic_mode_enabled(
     tmp_path, monkeypatch
 ):
