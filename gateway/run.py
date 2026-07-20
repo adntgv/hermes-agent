@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import concurrent.futures
+import copy
 import dataclasses
 import html
 import inspect
@@ -10046,8 +10047,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Offer authorized external messages to optional async dispatch plugins
         # before bespoke routing, command handling, or normal agent execution.
         _quick_key = self._session_key_for_source(source)
-        _authorized_platform = source.platform
-        _authorized_user_id = str(source.user_id or "")
+
+        def _plugin_authority(source_value):
+            return (
+                source_value.platform,
+                str(source_value.user_id or ""),
+                str(source_value.user_id_alt or ""),
+                str(source_value.scope_id or ""),
+                str(source_value.guild_id or ""),
+                str(source_value.profile or ""),
+                bool(source_value.role_authorized),
+                bool(source_value.delivered_via_upstream_relay),
+                bool(source_value.is_bot),
+            )
+
+        _authorized_plugin_authority = _plugin_authority(source)
         if not is_internal:
             try:
                 from gateway.plugin_dispatch import (
@@ -10058,10 +10072,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from hermes_cli.plugins import ainvoke_hook as _ainvoke_hook
 
                 def _validate_plugin_target(plugin_source):
-                    if plugin_source.platform != _authorized_platform:
-                        raise PermissionError("plugin target platform differs from authorized origin")
-                    if str(plugin_source.user_id or "") != _authorized_user_id:
-                        raise PermissionError("plugin target user differs from authorized origin")
+                    if _plugin_authority(plugin_source) != _authorized_plugin_authority:
+                        raise PermissionError(
+                            "plugin target authority differs from authorized origin"
+                        )
 
                 async def _plugin_send(plugin_source, text, *, metadata=None):
                     _validate_plugin_target(plugin_source)
@@ -10102,7 +10116,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 dispatch_lock = dispatch_locks.setdefault(_quick_key, asyncio.Lock())
                 plugin_source_snapshot = dataclasses.replace(source)
                 plugin_event_snapshot = dataclasses.replace(
-                    event, source=plugin_source_snapshot
+                    event,
+                    source=plugin_source_snapshot,
+                    raw_message=copy.deepcopy(event.raw_message),
+                    media_urls=list(event.media_urls),
+                    media_types=list(event.media_types),
+                    auto_skill=copy.deepcopy(event.auto_skill),
+                    metadata=copy.deepcopy(event.metadata),
                 )
                 async with dispatch_lock:
                     dispatch_results = await _ainvoke_hook(

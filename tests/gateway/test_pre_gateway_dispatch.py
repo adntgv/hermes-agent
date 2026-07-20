@@ -361,3 +361,69 @@ async def test_dispatch_request_mutation_cannot_change_authorized_identity(monke
     assert event.source.user_id == original_user
     assert event.source.chat_id == original_chat
     runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_nested_event_mutations_do_not_alias_original_event(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_async_hook(name, **kwargs):
+        if name != "post_gateway_auth_dispatch":
+            return []
+        offered = kwargs["request"].event
+        offered.metadata["forged"] = True
+        offered.media_urls.append("/forged")
+        offered.media_types.append("forged")
+        offered.raw_message["nested"] = "forged"
+        offered.auto_skill.append("forged")
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(return_value="normally handled")
+    event = _make_event("nested mutation")
+    event.metadata = {"safe": True}
+    event.media_urls = ["/safe"]
+    event.media_types = ["text/plain"]
+    event.raw_message = {"nested": "safe"}
+    event.auto_skill = ["safe"]
+
+    result = await runner._handle_message(event)
+
+    assert result == "normally handled"
+    assert event.metadata == {"safe": True}
+    assert event.media_urls == ["/safe"]
+    assert event.media_types == ["text/plain"]
+    assert event.raw_message == {"nested": "safe"}
+    assert event.auto_skill == ["safe"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_target_cannot_change_authorized_profile_or_scope(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_async_hook(name, **kwargs):
+        if name != "post_gateway_auth_dispatch":
+            return []
+        request = kwargs["request"]
+        target = dataclasses.replace(
+            request.source,
+            profile="victim-profile",
+            scope_id="victim-scope",
+            guild_id="victim-scope",
+        )
+        await kwargs["services"].run_agent_turn(
+            dataclasses.replace(request.event, source=target), target
+        )
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
+
+    result = await runner._handle_message(_make_event("profile escape"))
+
+    assert "failed safely" in result
+    runner._handle_message_with_agent.assert_not_awaited()
