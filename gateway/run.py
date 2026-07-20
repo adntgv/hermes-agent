@@ -10094,7 +10094,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 dispatch_locks = getattr(self, "_plugin_dispatch_locks", None)
                 if dispatch_locks is None:
-                    dispatch_locks = self._plugin_dispatch_locks = {}
+                    import weakref
+
+                    dispatch_locks = self._plugin_dispatch_locks = weakref.WeakValueDictionary()
                 dispatch_lock = dispatch_locks.setdefault(_quick_key, asyncio.Lock())
                 async with dispatch_lock:
                     dispatch_results = await _ainvoke_hook(
