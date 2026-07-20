@@ -5,6 +5,7 @@ agent dispatch. It runs in _handle_message and acts on returned action
 dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -12,6 +13,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
+from gateway.plugin_dispatch import GatewayDispatchDecision
 from gateway.session import SessionSource
 
 
@@ -177,3 +179,66 @@ async def test_internal_events_bypass_hook(monkeypatch):
     # Even though the hook would say skip, internal events bypass it.
     await runner._handle_message(event)
     assert called["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_post_auth_dispatch_plugin_can_send_and_run_target_turn(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    seen = {}
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen["event"] = event
+        seen["source"] = source
+        return {"final_response": "target done", "session_id": "s-target"}
+
+    async def _fake_async_hook(name, **kwargs):
+        assert name == "post_gateway_auth_dispatch"
+        request = kwargs["request"]
+        services = kwargs["services"]
+        await services.send(request.source, "plugin start", metadata={"tag": "x"})
+        target_source = dataclasses.replace(
+            request.source,
+            chat_id="target-chat",
+            chat_type="group",
+            thread_id="143",
+        )
+        target_event = dataclasses.replace(request.event, source=target_source)
+        turn = await services.run_agent_turn(target_event, target_source)
+        assert turn.final_response == "target done"
+        assert turn.session_id == "s-target"
+        return [GatewayDispatchDecision.handled("plugin ack")]
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_async_hook)
+    runner._handle_message_with_agent = _capture
+
+    result = await runner._handle_message(_make_event("route me"))
+
+    assert result == "plugin ack"
+    adapter.send.assert_awaited_once()
+    assert seen["source"].chat_id == "target-chat"
+    assert seen["source"].thread_id == "143"
+    assert seen["event"].internal is True
+
+
+@pytest.mark.asyncio
+async def test_post_auth_dispatch_hook_never_sees_unauthorized_or_internal_events(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    called = []
+
+    async def _fake_async_hook(name, **kwargs):
+        called.append(name)
+        return [GatewayDispatchDecision.handled("should not run")]
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.pairing_store.generate_code.return_value = None
+
+    assert await runner._handle_message(_make_event("unauthorized")) is None
+
+    internal = _make_event("internal")
+    internal.internal = True
+    runner._handle_message_with_agent = AsyncMock(return_value="normal")
+    assert await runner._handle_message(internal) == "normal"
+    assert called == []

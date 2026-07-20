@@ -10043,6 +10043,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        # Offer authorized external messages to optional async dispatch plugins
+        # before bespoke routing, command handling, or normal agent execution.
+        if not is_internal:
+            try:
+                from gateway.plugin_dispatch import (
+                    GatewayDispatchDecision,
+                    GatewayDispatchRequest,
+                    GatewayDispatchServices,
+                )
+                from hermes_cli.plugins import ainvoke_hook as _ainvoke_hook
+
+                async def _plugin_send(plugin_source, text, *, metadata=None):
+                    adapter = self._adapter_for_source(plugin_source)
+                    if adapter is None:
+                        raise RuntimeError(
+                            f"No adapter available for {plugin_source.platform.value}"
+                        )
+                    send_metadata = dict(metadata or {})
+                    if plugin_source.thread_id:
+                        send_metadata.setdefault("thread_id", plugin_source.thread_id)
+                    return await adapter.send(
+                        plugin_source.chat_id,
+                        text,
+                        metadata=send_metadata or None,
+                    )
+
+                async def _plugin_run_agent_turn(plugin_event, plugin_source):
+                    internal_event = dataclasses.replace(
+                        plugin_event,
+                        source=plugin_source,
+                        internal=True,
+                    )
+                    return await self._handle_message(internal_event)
+
+                dispatch_services = GatewayDispatchServices(
+                    send=_plugin_send,
+                    run_agent_turn=_plugin_run_agent_turn,
+                )
+                dispatch_results = await _ainvoke_hook(
+                    "post_gateway_auth_dispatch",
+                    request=GatewayDispatchRequest(event=event, source=source),
+                    services=dispatch_services,
+                )
+                for decision in dispatch_results:
+                    if not isinstance(decision, GatewayDispatchDecision):
+                        continue
+                    if decision.action == "handled":
+                        return decision.response
+            except Exception as exc:
+                logger.warning("post_gateway_auth_dispatch failed open: %s", exc)
+
         # Telegram DM -> workspace topic routing.  This runs after normal
         # authorization, before per-session interceptors, so Aidyn can use the
         # private DM as an intake/control plane while execution happens visibly

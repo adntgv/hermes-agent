@@ -171,6 +171,11 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Authorized external messages only. Async callbacks receive a
+    # GatewayDispatchRequest plus restricted GatewayDispatchServices and may
+    # return GatewayDispatchDecision.handled(...). Internal and unauthorized
+    # events never invoke this hook.
+    "post_gateway_auth_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
