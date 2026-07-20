@@ -241,4 +241,35 @@ async def test_post_auth_dispatch_hook_never_sees_unauthorized_or_internal_event
     internal.internal = True
     runner._handle_message_with_agent = AsyncMock(return_value="normal")
     assert await runner._handle_message(internal) == "normal"
-    assert called == []
+    assert "post_gateway_auth_dispatch" not in called
+    assert called == ["post_gateway_turn"]
+
+
+@pytest.mark.asyncio
+async def test_post_gateway_turn_hook_receives_completed_authorized_turn(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    calls = []
+
+    async def _fake_async_hook(name, **kwargs):
+        calls.append((name, kwargs))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(
+        return_value={"final_response": "done", "session_id": "s1"}
+    )
+    event = _make_event("finish")
+
+    result = await runner._handle_message(event)
+
+    assert result["final_response"] == "done"
+    assert [name for name, _ in calls] == [
+        "post_gateway_auth_dispatch",
+        "post_gateway_turn",
+    ]
+    turn_kwargs = calls[-1][1]
+    assert turn_kwargs["event"] is event
+    assert turn_kwargs["source"] == event.source
+    assert turn_kwargs["result"] == result

@@ -176,6 +176,12 @@ VALID_HOOKS: Set[str] = {
     # return GatewayDispatchDecision.handled(...). Internal and unauthorized
     # events never invoke this hook.
     "post_gateway_auth_dispatch",
+    # Sync session-context enrichment. Callbacks receive source, config, and
+    # session_entry and may return {"topic_context": "..."} or a string.
+    "enrich_gateway_session_context",
+    # Async notification after one gateway agent turn completes. Callbacks
+    # receive event, source, and the raw core result.
+    "post_gateway_turn",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

@@ -2812,17 +2812,25 @@ def build_session_context(
         ),
     )
 
-    if source.platform == Platform.TELEGRAM and source.chat_type != "dm" and source.thread_id:
-        try:
-            from .telegram_topics import TelegramTopicRegistry
+    # Plugins may enrich platform/session-specific context without coupling
+    # gateway/session.py to a platform implementation.
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
 
-            context.topic_context = TelegramTopicRegistry().format_topic_context(
-                chat_id=str(source.chat_id),
-                thread_id=str(source.thread_id),
-                chat_name=source.chat_name,
-            )
-        except Exception:
-            logger.debug("Could not load Telegram topic context", exc_info=True)
+        for result in _invoke_hook(
+            "enrich_gateway_session_context",
+            source=source,
+            config=config,
+            session_entry=session_entry,
+        ):
+            if isinstance(result, dict) and result.get("topic_context"):
+                context.topic_context = str(result["topic_context"])
+                break
+            if isinstance(result, str) and result.strip():
+                context.topic_context = result
+                break
+    except Exception:
+        logger.debug("Could not enrich gateway session context", exc_info=True)
     
     if session_entry:
         context.session_key = session_entry.session_key

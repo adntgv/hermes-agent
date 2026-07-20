@@ -11537,6 +11537,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            try:
+                from hermes_cli.plugins import ainvoke_hook as _ainvoke_hook
+
+                await _ainvoke_hook(
+                    "post_gateway_turn",
+                    event=event,
+                    source=source,
+                    result=_agent_result,
+                )
+            except Exception as exc:
+                logger.warning("post_gateway_turn failed open: %s", exc)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
