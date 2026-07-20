@@ -1941,8 +1941,10 @@ class PluginManager:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
 
-    async def ainvoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
-        """Invoke sync or async hook callbacks sequentially and fail open."""
+    async def ainvoke_hook(
+        self, hook_name: str, *, fail_open: bool = True, **kwargs: Any
+    ) -> List[Any]:
+        """Invoke callbacks sequentially; optionally propagate callback failures."""
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         results: List[Any] = []
         for cb in self._hooks.get(hook_name, []):
@@ -1959,6 +1961,8 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+                if not fail_open:
+                    raise
         return results
 
     def has_middleware(self, kind: str) -> bool:
@@ -2085,9 +2089,13 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
-async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+async def ainvoke_hook(
+    hook_name: str, *, fail_open: bool = True, **kwargs: Any
+) -> List[Any]:
     """Invoke sync or async lifecycle hooks through the global manager."""
-    return await get_plugin_manager().ainvoke_hook(hook_name, **kwargs)
+    return await get_plugin_manager().ainvoke_hook(
+        hook_name, fail_open=fail_open, **kwargs
+    )
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

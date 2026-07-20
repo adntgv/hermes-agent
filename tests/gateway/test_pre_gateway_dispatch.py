@@ -5,6 +5,7 @@ agent dispatch. It runs in _handle_message and acts on returned action
 dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
+import asyncio
 import dataclasses
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -273,3 +274,61 @@ async def test_post_gateway_turn_hook_receives_completed_authorized_turn(monkeyp
     assert turn_kwargs["event"] is event
     assert turn_kwargs["source"] == event.source
     assert turn_kwargs["result"] == result
+
+
+@pytest.mark.asyncio
+async def test_post_auth_dispatch_is_serialized_per_session(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    active = 0
+    maximum = 0
+
+    async def _fake_async_hook(name, **_kwargs):
+        nonlocal active, maximum
+        if name != "post_gateway_auth_dispatch":
+            return []
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return []
+
+    async def _normal(*_args, **_kwargs):
+        await asyncio.sleep(0.01)
+        return "normal"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(side_effect=_normal)
+
+    await asyncio.gather(
+        runner._handle_message(_make_event("one")),
+        runner._handle_message(_make_event("two")),
+    )
+
+    assert maximum == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_service_rejects_different_target_user(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_async_hook(name, **kwargs):
+        if name != "post_gateway_auth_dispatch":
+            return []
+        request = kwargs["request"]
+        services = kwargs["services"]
+        target_source = dataclasses.replace(request.source, user_id="other-user")
+        target_event = dataclasses.replace(request.event, source=target_source)
+        await services.run_agent_turn(target_event, target_source)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_async_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = AsyncMock(return_value="must not run")
+
+    result = await runner._handle_message(_make_event("route elsewhere"))
+
+    assert "failed safely" in result
+    runner._handle_message_with_agent.assert_not_awaited()

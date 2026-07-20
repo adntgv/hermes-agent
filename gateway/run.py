@@ -10045,6 +10045,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Offer authorized external messages to optional async dispatch plugins
         # before bespoke routing, command handling, or normal agent execution.
+        _quick_key = self._session_key_for_source(source)
         if not is_internal:
             try:
                 from gateway.plugin_dispatch import (
@@ -10054,7 +10055,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 from hermes_cli.plugins import ainvoke_hook as _ainvoke_hook
 
+                def _validate_plugin_target(plugin_source):
+                    if plugin_source.platform != source.platform:
+                        raise PermissionError("plugin target platform differs from authorized origin")
+                    if str(plugin_source.user_id or "") != str(source.user_id or ""):
+                        raise PermissionError("plugin target user differs from authorized origin")
+
                 async def _plugin_send(plugin_source, text, *, metadata=None):
+                    _validate_plugin_target(plugin_source)
                     adapter = self._adapter_for_source(plugin_source)
                     if adapter is None:
                         raise RuntimeError(
@@ -10070,6 +10078,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
                 async def _plugin_run_agent_turn(plugin_event, plugin_source):
+                    _validate_plugin_target(plugin_source)
+                    if plugin_event.source != plugin_source:
+                        raise PermissionError("plugin event/source mismatch")
                     internal_event = dataclasses.replace(
                         plugin_event,
                         source=plugin_source,
@@ -10081,18 +10092,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     send=_plugin_send,
                     run_agent_turn=_plugin_run_agent_turn,
                 )
-                dispatch_results = await _ainvoke_hook(
-                    "post_gateway_auth_dispatch",
-                    request=GatewayDispatchRequest(event=event, source=source),
-                    services=dispatch_services,
-                )
-                for decision in dispatch_results:
-                    if not isinstance(decision, GatewayDispatchDecision):
-                        continue
-                    if decision.action == "handled":
-                        return decision.response
-            except Exception as exc:
-                logger.warning("post_gateway_auth_dispatch failed open: %s", exc)
+                dispatch_locks = getattr(self, "_plugin_dispatch_locks", None)
+                if dispatch_locks is None:
+                    dispatch_locks = self._plugin_dispatch_locks = {}
+                dispatch_lock = dispatch_locks.setdefault(_quick_key, asyncio.Lock())
+                async with dispatch_lock:
+                    dispatch_results = await _ainvoke_hook(
+                        "post_gateway_auth_dispatch",
+                        request=GatewayDispatchRequest(event=event, source=source),
+                        services=dispatch_services,
+                        fail_open=False,
+                    )
+                    for decision in dispatch_results:
+                        if not isinstance(decision, GatewayDispatchDecision):
+                            continue
+                        if decision.action == "handled":
+                            return decision.response
+            except Exception:
+                logger.exception("post_gateway_auth_dispatch failed closed")
+                return "The message router failed safely before processing. Please retry shortly."
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -10102,7 +10120,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # IMPORTANT: recognized slash commands must bypass this interception.
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
-        _quick_key = self._session_key_for_source(source)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()

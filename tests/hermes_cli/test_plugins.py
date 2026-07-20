@@ -647,6 +647,19 @@ class TestPluginHooks:
         ) == ["one", "two"]
         assert calls == [("first", "x"), ("second", "x"), ("broken", "x")]
 
+    @pytest.mark.asyncio
+    async def test_ainvoke_hook_can_fail_closed_for_side_effecting_dispatch(self):
+        manager = PluginManager()
+
+        async def broken(**_kwargs):
+            raise RuntimeError("partial side effect")
+
+        manager._hooks["post_gateway_auth_dispatch"] = [broken]
+        with pytest.raises(RuntimeError, match="partial side effect"):
+            await manager.ainvoke_hook(
+                "post_gateway_auth_dispatch", fail_open=False
+            )
+
     def test_valid_hooks_include_request_scoped_api_hooks(self):
         assert "pre_api_request" in VALID_HOOKS
         assert "post_api_request" in VALID_HOOKS
