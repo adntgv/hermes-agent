@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Mapping, Optional
 
@@ -51,7 +52,7 @@ RunAgentTurnCallback = Callable[
 class GatewayDispatchServices:
     """Restricted host operations available to dispatch plugins."""
 
-    __slots__ = ("_send", "_run_agent_turn")
+    __slots__ = ("_send", "_run_agent_turn", "_turn_claimed", "_turn_lock")
 
     def __init__(
         self,
@@ -61,6 +62,8 @@ class GatewayDispatchServices:
     ) -> None:
         self._send = send
         self._run_agent_turn = run_agent_turn
+        self._turn_claimed = False
+        self._turn_lock = asyncio.Lock()
 
     async def send(
         self,
@@ -76,6 +79,12 @@ class GatewayDispatchServices:
         event: MessageEvent,
         source: SessionSource,
     ) -> GatewayAgentTurnResult:
+        async with self._turn_lock:
+            if self._turn_claimed:
+                raise RuntimeError(
+                    "dispatch plugin may request at most one agent turn per event"
+                )
+            self._turn_claimed = True
         result = await self._run_agent_turn(event, source)
         if isinstance(result, GatewayAgentTurnResult):
             return result

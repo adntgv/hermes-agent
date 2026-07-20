@@ -34,6 +34,9 @@ async def test_dispatch_services_expose_only_send_and_one_agent_turn():
         source, "started", metadata={"thread_id": "143"}
     )
     run_turn.assert_awaited_once_with(event, source)
+    with pytest.raises(RuntimeError, match="at most one agent turn"):
+        await services.run_agent_turn(event, source)
+    assert run_turn.await_count == 1
     assert not hasattr(services, "runner")
     assert not hasattr(services, "adapters")
     assert not hasattr(services, "config")

@@ -10046,6 +10046,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Offer authorized external messages to optional async dispatch plugins
         # before bespoke routing, command handling, or normal agent execution.
         _quick_key = self._session_key_for_source(source)
+        _authorized_platform = source.platform
+        _authorized_user_id = str(source.user_id or "")
         if not is_internal:
             try:
                 from gateway.plugin_dispatch import (
@@ -10056,9 +10058,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from hermes_cli.plugins import ainvoke_hook as _ainvoke_hook
 
                 def _validate_plugin_target(plugin_source):
-                    if plugin_source.platform != source.platform:
+                    if plugin_source.platform != _authorized_platform:
                         raise PermissionError("plugin target platform differs from authorized origin")
-                    if str(plugin_source.user_id or "") != str(source.user_id or ""):
+                    if str(plugin_source.user_id or "") != _authorized_user_id:
                         raise PermissionError("plugin target user differs from authorized origin")
 
                 async def _plugin_send(plugin_source, text, *, metadata=None):
@@ -10098,10 +10100,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     dispatch_locks = self._plugin_dispatch_locks = weakref.WeakValueDictionary()
                 dispatch_lock = dispatch_locks.setdefault(_quick_key, asyncio.Lock())
+                plugin_source_snapshot = dataclasses.replace(source)
+                plugin_event_snapshot = dataclasses.replace(
+                    event, source=plugin_source_snapshot
+                )
                 async with dispatch_lock:
                     dispatch_results = await _ainvoke_hook(
                         "post_gateway_auth_dispatch",
-                        request=GatewayDispatchRequest(event=event, source=source),
+                        request=GatewayDispatchRequest(
+                            event=plugin_event_snapshot,
+                            source=plugin_source_snapshot,
+                        ),
                         services=dispatch_services,
                         fail_open=False,
                     )
