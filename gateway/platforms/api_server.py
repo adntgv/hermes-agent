@@ -123,6 +123,7 @@ from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, is_network_accessible, validate_media_delivery_path)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from gateway import visual_report_store
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -772,6 +773,22 @@ class ResponseStore:
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key"}
+
+
+def _request_origin_matches_host(request: Any, origin: str) -> bool:
+    """Return true when a browser Origin matches the forwarded request host."""
+    if not origin or origin == "null":
+        return False
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        origin_host = (parsed.netloc or "").lower()
+        request_host = (request.host or request.headers.get("Host", "") or "").lower()
+        return parsed.scheme in {"http", "https"} and bool(origin_host) and origin_host == request_host
+    except Exception:
+        return False
+
+
 _SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
@@ -780,6 +797,21 @@ _SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "X-XSS-Protection": "0",
     "Referrer-Policy": "no-referrer"}
+_MINIAPP_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' https://telegram.org; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+        "connect-src 'self'; base-uri 'none'; form-action 'none'; "
+        "frame-ancestors https://web.telegram.org https://*.telegram.org"
+    ),
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-XSS-Protection": "0",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+}
 
 if AIOHTTP_AVAILABLE:
     @web.middleware
@@ -788,14 +820,15 @@ if AIOHTTP_AVAILABLE:
         adapter = request.app.get("api_server_adapter")
         origin = request.headers.get("Origin", "")
         cors_headers = None
+        same_origin = _request_origin_matches_host(request, origin)
         if adapter is not None:
-            if not adapter._origin_allowed(origin):
+            if not same_origin and not adapter._origin_allowed(origin):
                 return web.Response(status=403)
             cors_headers = adapter._cors_headers_for_origin(origin)
         if request.method == "OPTIONS":
-            if cors_headers is None:
+            if cors_headers is None and not same_origin:
                 return web.Response(status=403)
-            return web.Response(status=200, headers=cors_headers)
+            return web.Response(status=200, headers=cors_headers or {})
         response = await handler(request)
         if cors_headers is not None:
             response.headers.update(cors_headers)
@@ -822,9 +855,22 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def security_headers_middleware(request, handler):
         """Add security headers to all responses (including errors)."""
-        response = await handler(request)
-        for k, v in _SECURITY_HEADERS.items():
-            response.headers.setdefault(k, v)
+        raw_path = (getattr(request, "raw_path", "") or "").lower()
+        if raw_path.startswith("/miniapp/assets/") and any(
+            marker in raw_path for marker in ("..", "%2e", "%2f", "%5c")
+        ):
+            response = web.Response(status=403, text="asset path escapes miniapp static root")
+        else:
+            response = await handler(request)
+        is_miniapp = request.path.startswith("/miniapp")
+        headers = _MINIAPP_SECURITY_HEADERS if is_miniapp else _SECURITY_HEADERS
+        if is_miniapp:
+            response.headers.pop("X-Frame-Options", None)
+        for k, v in headers.items():
+            if is_miniapp:
+                response.headers[k] = v
+            else:
+                response.headers.setdefault(k, v)
         return response
 else:
     cors_middleware = body_limit_middleware = security_headers_middleware = None  # type: ignore
@@ -1138,6 +1184,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # @mssteuer.)
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False)
+        raw_miniapp = extra.get("miniapp") if isinstance(extra.get("miniapp"), dict) else {}
+        self._miniapp_extra: Dict[str, Any] = dict(raw_miniapp)
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1315,6 +1363,98 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ctx = self._request_audit_context(request)
         fields = [f"{key}={value!r}" for key, value in ctx.items() if value]
         return " ".join(fields) if fields else "source='unknown'"
+
+    _MINIAPP_CACHE_HEADERS = {
+        "Cache-Control": "no-store", "Pragma": "no-cache", "Expires": "0",
+    }
+
+    @staticmethod
+    def _miniapp_response_headers(*, content_type: str | None = None) -> Dict[str, str]:
+        headers = {**APIServerAdapter._MINIAPP_CACHE_HEADERS, **_MINIAPP_SECURITY_HEADERS}
+        if content_type:
+            headers["Content-Type"] = content_type
+        return headers
+
+    def _miniapp_static_root(self) -> Path:
+        configured = self._miniapp_extra.get("static_dir")
+        if configured:
+            try:
+                return Path(str(configured)).expanduser().resolve(strict=False)
+            except Exception:
+                logger.warning("[%s] Invalid miniapp static_dir ignored: %r", self.name, configured)
+        return (Path(__file__).resolve().parents[1] / "miniapp").resolve(strict=False)
+
+    @staticmethod
+    def _safe_resolve_relative(root: Path, relative_path: str) -> Optional[Path]:
+        rel = str(relative_path or "").replace("\\", "/").lstrip("/")
+        if not rel or "\x00" in rel:
+            return None
+        root_resolved = root.resolve(strict=False)
+        candidate = (root_resolved / rel).resolve(strict=False)
+        try:
+            candidate.relative_to(root_resolved)
+        except ValueError:
+            return None
+        return candidate
+
+    def _miniapp_shell_path(self) -> Optional[Path]:
+        return self._safe_resolve_relative(self._miniapp_static_root(), "index.html")
+
+    def _miniapp_asset_path(self, raw_path: str) -> Optional[Path]:
+        return self._safe_resolve_relative(self._miniapp_static_root() / "assets", raw_path)
+
+    def _browser_safe_miniapp_config(self) -> Dict[str, Any]:
+        safe: Dict[str, Any] = {
+            "app_name": "Hermes Report",
+            "description": "Latest generated Hermes report",
+            "accent": "#111111",
+            "endpoints": {"report_latest": "/miniapp/api/report/latest"},
+        }
+        for key in ("app_name", "description", "accent"):
+            value = self._miniapp_extra.get(key)
+            if isinstance(value, str) and value.strip():
+                safe[key] = value.strip()[:160]
+        return safe
+
+    async def _handle_miniapp_shell(self, request: "web.Request") -> "web.StreamResponse":
+        path = self._miniapp_shell_path()
+        if not path or not path.is_file():
+            raise web.HTTPNotFound(text="miniapp shell not found")
+        return web.FileResponse(
+            path, headers=self._miniapp_response_headers(content_type="text/html; charset=utf-8"),
+        )
+
+    async def _handle_miniapp_config(self, request: "web.Request") -> "web.Response":
+        return web.json_response(
+            self._browser_safe_miniapp_config(), headers=self._miniapp_response_headers(),
+        )
+
+    async def _handle_miniapp_latest_report(self, request: "web.Request") -> "web.Response":
+        payload = visual_report_store.load_latest_report()
+        if payload is None:
+            return web.json_response(
+                {"success": False, "error": "No report has been generated yet", "report": None},
+                status=404, headers=self._miniapp_response_headers(),
+            )
+        return web.json_response(
+            {"success": True, "report": payload}, headers=self._miniapp_response_headers(),
+        )
+
+    async def _handle_miniapp_asset(self, request: "web.Request") -> "web.StreamResponse":
+        path = self._miniapp_asset_path(request.match_info.get("path", ""))
+        if path is None:
+            raise web.HTTPForbidden(text="asset path escapes miniapp static root")
+        if not path.is_file():
+            raise web.HTTPNotFound(text="miniapp asset not found")
+        return web.FileResponse(path, headers=self._miniapp_response_headers())
+
+    def _register_miniapp_routes(self, app: "web.Application") -> None:
+        app.router.add_get("/miniapp", self._handle_miniapp_shell)
+        app.router.add_get("/miniapp/", self._handle_miniapp_shell)
+        app.router.add_get("/miniapp/index.html", self._handle_miniapp_shell)
+        app.router.add_get("/miniapp/config.json", self._handle_miniapp_config)
+        app.router.add_get("/miniapp/api/report/latest", self._handle_miniapp_latest_report)
+        app.router.add_get("/miniapp/assets/{path:.*}", self._handle_miniapp_asset)
 
     def _cron_origin_from_request(self, request: "web.Request") -> Dict[str, str]:
         """Persist safe API source metadata on cron jobs created over HTTP."""
@@ -3851,6 +3991,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            self._register_miniapp_routes(self._app)
             # After native routes: Relay bootstrap shims feature-detect on this key and must
             # no-op rather than shadow the native session-control handlers.
             self._app["api_server_adapter"] = self
