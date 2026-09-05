@@ -1716,6 +1716,11 @@ class GatewayTurnMixin:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
+        if response and not agent_result.get("already_sent") and not _intentional_silence:
+            html_notice = await self._maybe_deliver_long_telegram_response_as_html(event, response)
+            if html_notice:
+                response = html_notice
+
         adapter = self._adapter_for_source(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
