@@ -1122,6 +1122,28 @@ class TestBuildSystemPrompt:
         assert "SKILLS_PROMPT" in prompt
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
+        assert mock_skills.call_args.kwargs["index_mode"] == "full"
+
+    def test_skills_prompt_honors_names_only_config(self):
+        tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")
+        with (
+            patch("model_tools.get_tool_definitions", return_value=tools),
+            patch("model_tools.check_toolset_requirements", return_value={}),
+            patch("model_tools.get_toolset_for_tool", create=True, return_value="skills"),
+            patch("agent.prompt_builder.build_skills_system_prompt", return_value="SKILLS_PROMPT") as mock_skills,
+            patch("hermes_cli.config.load_config_readonly", return_value={"skills": {"prompt_mode": "names_only"}}),
+            patch("agent.process_bootstrap.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent._build_system_prompt()
+
+        assert mock_skills.call_args.kwargs["index_mode"] == "names_only"
 
 
 class TestToolUseEnforcementConfig:

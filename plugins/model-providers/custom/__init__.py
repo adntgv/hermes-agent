@@ -29,6 +29,12 @@ def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
+    @staticmethod
+    def _is_alem_qwen(*, model: str | None, base_url: str | None) -> bool:
+        """Return whether this call targets Alem's LiteLLM-backed Qwen route."""
+        hostname = (urlparse(str(base_url or "")).hostname or "").lower()
+        return hostname == "llm.alem.ai" and str(model or "").lower().startswith("qwen")
+
     def build_api_kwargs_extras(
         self, *, reasoning_config: dict | None = None, ollama_num_ctx: int | None = None, **ctx: Any
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -36,6 +42,13 @@ class CustomProfile(ProviderProfile):
         top_level: dict[str, Any] = {}
         if ollama_num_ctx:
             extra_body["options"] = {"num_ctx": ollama_num_ctx}
+        # Alem's LiteLLM route rejects both reasoning_effort and Ollama's
+        # think field. Keep other custom endpoints capability-aware.
+        if self._is_alem_qwen(
+            model=ctx.get("model"),
+            base_url=ctx.get("base_url"),
+        ):
+            return extra_body, top_level
         # disabled -> top-level reasoning_effort="none" (Ollama's /v1 ignores
         # extra_body.think) plus think=False only on Ollama URLs; enabled+effort ->
         # top-level reasoning_effort clamped to the OpenAI-compat wire (GLM/ARK,

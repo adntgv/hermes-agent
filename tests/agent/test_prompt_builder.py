@@ -313,6 +313,24 @@ class TestBuildSkillsSystemPrompt:
 
 
 
+    def test_names_only_mode_keeps_discovery_without_descriptions(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for name, desc in (("python-debug", "Debug Python scripts"), ("api-review", "Review APIs")):
+            skill_dir = tmp_path / "skills" / "coding" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {desc}\n---\n"
+            )
+
+        result = build_skills_system_prompt(index_mode="names_only")
+
+        assert "coding [names only]: api-review, python-debug" in result
+        assert "Debug Python scripts" not in result
+        assert "Review APIs" not in result
+        assert "skills_list" in result
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"

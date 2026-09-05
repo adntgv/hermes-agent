@@ -169,6 +169,38 @@ class TestCustomReasoningWireShape:
         )
         assert eb.get("think") is not True
 
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [
+            {"enabled": True, "effort": "medium"},
+            {"enabled": False},
+            {"enabled": True, "effort": "none"},
+        ],
+    )
+    def test_alem_qwen_omits_unsupported_reasoning_controls(
+        self, custom_profile, reasoning_config
+    ):
+        """Alem's LiteLLM Qwen route rejects reasoning_effort and think."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config=reasoning_config,
+            model="qwen3-6-27b",
+            base_url="https://llm.alem.ai/v1",
+        )
+        assert eb == {}
+        assert tl == {}
+
+    def test_other_custom_qwen_endpoints_keep_reasoning_controls(
+        self, custom_profile
+    ):
+        """The compatibility guard must not disable reasoning globally."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            model="qwen3",
+            base_url="http://127.0.0.1:11434/v1",
+        )
+        assert eb == {}
+        assert tl == {"reasoning_effort": "medium"}
+
 
 class TestCustomReasoningWithNumCtx:
     """Ollama num_ctx and reasoning are independent and compose."""

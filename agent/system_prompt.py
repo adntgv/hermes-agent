@@ -307,8 +307,15 @@ def _skills_prompt(agent: Any) -> str:
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
+    try:
+        from hermes_cli.config import load_config_readonly
+        _skills_cfg = load_config_readonly().get("skills") or {}
+        _skill_index_mode = str(_skills_cfg.get("prompt_mode") or "full")
+    except Exception:
+        _skill_index_mode = "full"
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+                                         index_mode=_skill_index_mode)
 
 
 def _bot_mode_parts(agent: Any) -> List[str]:
