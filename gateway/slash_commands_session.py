@@ -658,10 +658,80 @@ class GatewaySessionCommandsMixin:
 
     # ------------------------------------------------------------------------ /topic
 
+    async def _handle_telegram_topic_model_command(
+        self, event: MessageEvent, raw_target: str
+    ) -> str:
+        """Inspect, set, or clear the model pinned to one Telegram topic."""
+        from gateway.run import _hermes_home
+        from gateway.slash_commands_model import _ModelSwitchContext
+        from gateway.telegram_topic_models import get_telegram_topic_model_store
+        from hermes_cli.model_switch import parse_model_switch_args
+
+        source = event.source
+        if not source.thread_id:
+            return "Topic model overrides must be configured inside a Telegram topic."
+        store = get_telegram_topic_model_store()
+        target = raw_target.strip()
+        if not target:
+            current = store.get(source.chat_id, source.thread_id)
+            if not current:
+                return "This topic uses the normal session or global model."
+            provider = current.get("provider") or "default provider"
+            return f"Topic model: `{current['model']}` via `{provider}`."
+        if target.lower() in {"off", "clear", "default", "reset"}:
+            removed = store.clear(source.chat_id, source.thread_id)
+            self._evict_cached_agent(self._session_key_for_source(source))
+            return (
+                "Topic model override cleared."
+                if removed
+                else "This topic already uses the normal session or global model."
+            )
+
+        request = parse_model_switch_args(target)
+        if request.errors:
+            return f"Invalid topic model: {request.error_messages()[0]}"
+        if not request.target and not request.explicit_provider:
+            return "Usage: `/topic model <model>` or `/topic model off`."
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+        session_key = self._session_key_for_source(source)
+        ctx = _ModelSwitchContext(
+            session_key=session_key,
+            source=source,
+            config_path=(profile_home or _hermes_home) / "config.yaml",
+            persist_global=False,
+        )
+        ctx.read_config()
+        result, error = await self._perform_model_switch(
+            ctx, request.target, request.explicit_provider, source
+        )
+        if error is not None:
+            return error
+        stored = store.set(
+            source.chat_id,
+            source.thread_id,
+            {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+            },
+        )
+        self._evict_cached_agent(session_key)
+        return f"Topic model set to `{stored['model']}` via `{stored.get('provider') or 'default'}`."
+
     async def _handle_topic_command(self, event: MessageEvent, args: str = "") -> str:
         """Handle /topic for Telegram DM user-managed topic sessions."""
         source = event.source
-        if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
+        if source.platform != Platform.TELEGRAM:
+            return t("gateway.topic.not_telegram_dm")
+        command_args = event.get_command_args().strip()
+        model_command, separator, model_target = command_args.partition(" ")
+        if model_command.lower() == "model":
+            return await self._handle_telegram_topic_model_command(
+                event, model_target if separator else ""
+            )
+        if source.chat_type != "dm":
             return t("gateway.topic.not_telegram_dm")
         if not self._session_db:
             return self._session_db_unavailable_reply()
@@ -673,7 +743,7 @@ class GatewaySessionCommandsMixin:
         except Exception:
             logger.debug("Topic auth check failed", exc_info=True)
 
-        args = event.get_command_args().strip()
+        args = command_args
         if args.lower() in {"help", "?", "-h", "--help"}:
             return self._telegram_topic_help_text()
         if args.lower() in {"off", "disable", "stop"}:

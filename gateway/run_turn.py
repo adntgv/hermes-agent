@@ -50,8 +50,8 @@ class GatewayTurnMixin:
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
-        (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
+        Priority (highest first): Telegram topic → session ``/model`` → ``channel_overrides`` →
+        global config/env (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
         from gateway.run import (
             _credential_pool_for_provider, _get_channel_override, _resolve_gateway_model,
             _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
@@ -59,6 +59,38 @@ class GatewayTurnMixin:
         skey = self._resolve_session_key_or_none(source, session_key)
 
         model = _resolve_gateway_model(user_config)
+        topic_override = None
+        if (
+            source is not None
+            and source.platform == Platform.TELEGRAM
+            and source.chat_id
+            and source.thread_id
+        ):
+            try:
+                from gateway.telegram_topic_models import get_telegram_topic_model_store
+
+                topic_override = get_telegram_topic_model_store().get(
+                    source.chat_id, source.thread_id
+                )
+            except Exception:
+                logger.debug("Failed to load Telegram topic model override", exc_info=True)
+        if topic_override:
+            topic_model = topic_override["model"]
+            topic_provider = topic_override.get("provider")
+            if topic_provider:
+                runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(topic_provider)
+            else:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs.pop("model", None)
+            if topic_override.get("base_url"):
+                runtime_kwargs["base_url"] = topic_override["base_url"]
+            logger.info(
+                "Telegram topic model override: chat=%s thread=%s model=%s provider=%s",
+                source.chat_id, source.thread_id, topic_model,
+                runtime_kwargs.get("provider") or topic_provider or "default",
+            )
+            return topic_model, runtime_kwargs
+
         if skey:
             self._rehydrate_session_model_override(skey)
         _override_state = self._peek_session_state(skey) if skey else None
