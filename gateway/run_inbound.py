@@ -11,6 +11,7 @@ import logging
 from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures
+import copy
 import dataclasses
 import json
 import os
@@ -107,6 +108,78 @@ class GatewayInboundMixin:
         if not code:
             # Record rate limit so subsequent messages are silently ignored
             pairing_store._record_rate_limit(platform_name, source.user_id)
+
+    async def _hm_post_gateway_auth_dispatch(
+        self, event: "MessageEvent", source: SessionSource, session_key: str
+    ) -> tuple[bool, Optional[str]]:
+        """Offer one authorized external event to restricted async plugins."""
+        from gateway.plugin_dispatch import (
+            GatewayDispatchDecision, GatewayDispatchRequest, GatewayDispatchServices,
+        )
+        from hermes_cli.plugins import ainvoke_hook
+
+        def authority(value: SessionSource) -> tuple[Any, ...]:
+            return (
+                value.platform,
+                str(value.user_id or ""), str(value.user_id_alt or ""),
+                str(value.scope_id or ""), str(value.guild_id or ""),
+                str(value.profile or ""), bool(value.role_authorized),
+                bool(value.delivered_via_upstream_relay), bool(value.is_bot),
+            )
+
+        authorized_authority = authority(source)
+
+        def validate_target(plugin_source: SessionSource) -> None:
+            if authority(plugin_source) != authorized_authority:
+                raise PermissionError("plugin target authority differs from authorized origin")
+
+        async def send(plugin_source, text, *, metadata=None):
+            validate_target(plugin_source)
+            adapter = self._adapter_for_source(plugin_source)
+            if adapter is None:
+                raise RuntimeError(f"No adapter available for {plugin_source.platform.value}")
+            send_metadata = dict(metadata or {})
+            if plugin_source.thread_id:
+                send_metadata.setdefault("thread_id", plugin_source.thread_id)
+            return await adapter.send(
+                plugin_source.chat_id, text, metadata=send_metadata or None,
+            )
+
+        async def run_agent_turn(plugin_event, plugin_source):
+            validate_target(plugin_source)
+            if plugin_event.source != plugin_source:
+                raise PermissionError("plugin event/source mismatch")
+            return await self._handle_message(dataclasses.replace(
+                plugin_event, source=plugin_source, internal=True,
+            ))
+
+        services = GatewayDispatchServices(send=send, run_agent_turn=run_agent_turn)
+        locks = getattr(self, "_plugin_dispatch_locks", None)
+        if locks is None:
+            import weakref
+            locks = self._plugin_dispatch_locks = weakref.WeakValueDictionary()
+        lock = locks.setdefault(session_key, asyncio.Lock())
+        source_snapshot = dataclasses.replace(source)
+        event_snapshot = dataclasses.replace(
+            event,
+            source=source_snapshot,
+            raw_message=copy.deepcopy(event.raw_message),
+            media_urls=list(event.media_urls),
+            media_types=list(event.media_types),
+            auto_skill=copy.deepcopy(event.auto_skill),
+            metadata=copy.deepcopy(event.metadata),
+        )
+        async with lock:
+            results = await ainvoke_hook(
+                "post_gateway_auth_dispatch",
+                request=GatewayDispatchRequest(event=event_snapshot, source=source_snapshot),
+                services=services,
+                fail_open=False,
+            )
+        for result in results:
+            if isinstance(result, GatewayDispatchDecision) and result.action == "handled":
+                return True, result.response
+        return False, None
 
     async def _hm_admit_event(
         self, event: "MessageEvent"
@@ -1187,6 +1260,16 @@ class GatewayInboundMixin:
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
+        if not is_internal:
+            try:
+                _handled, _plugin_response = await self._hm_post_gateway_auth_dispatch(
+                    event, source, _quick_key,
+                )
+            except Exception:
+                logger.exception("post_gateway_auth_dispatch failed closed")
+                return "The message router failed safely before processing. Please retry shortly."
+            if _handled:
+                return _plugin_response
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

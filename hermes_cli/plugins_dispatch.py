@@ -198,6 +198,28 @@ class PluginDispatchMixin:
                     "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
         return results
 
+    async def ainvoke_hook(
+        self, hook_name: str, *, fail_open: bool = True, **kwargs: Any
+    ) -> List[Any]:
+        """Invoke sync or async callbacks sequentially."""
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for callback in self._hooks.get(hook_name, []):
+            try:
+                result = self._invoke_hook_callback(callback, kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is not None:
+                    results.append(result)
+            except Exception as exc:
+                logger.warning(
+                    "Async hook '%s' callback %s raised: %s",
+                    hook_name, getattr(callback, "__name__", repr(callback)), exc,
+                )
+                if not fail_open:
+                    raise
+        return results
+
     def _run_hook_callback_bounded(
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float
     ) -> Any:

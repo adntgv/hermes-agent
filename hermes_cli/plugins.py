@@ -130,6 +130,11 @@ VALID_HOOKS: Set[str] = {
     # auth/pairing and dispatch. Kwargs: event, gateway, session_store. Return {"action": "skip",
     # "reason"} -> drop; {"action": "rewrite", "text"} -> replace event.text; "allow"/None -> normal.
     "pre_gateway_dispatch",
+    # Authorized external messages only. Async callbacks receive a restricted
+    # request/services pair and may fully handle the event.
+    "post_gateway_auth_dispatch",
+    # Session-context enrichment and post-turn observation for gateway plugins.
+    "enrich_gateway_session_context", "post_gateway_turn",
     # Approval observers (tools/approval.py); returns ignored — plugins cannot veto or pre-answer
     # (use pre_tool_call). Kwargs: command, description, pattern_key, pattern_keys, session_key,
     # surface: "cli"|"gateway"|"smart"; post_approval_response adds choice ("once"|"session"|
@@ -1677,6 +1682,15 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     callbacks registered by user plugins (tracking #64178).
     """
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
+
+
+async def ainvoke_hook(
+    hook_name: str, *, fail_open: bool = True, **kwargs: Any
+) -> List[Any]:
+    """Invoke sync or async lifecycle hooks through the global manager."""
+    return await _delivery_manager().ainvoke_hook(
+        hook_name, fail_open=fail_open, **kwargs
+    )
 
 
 def render_system_prompt_sections(session_info: Mapping[str, Any]) -> List[RenderedPluginSystemPromptSection]:

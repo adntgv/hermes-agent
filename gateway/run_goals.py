@@ -274,6 +274,13 @@ class GatewayGoalsMixin:
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
+        try:
+            from hermes_cli.plugins import ainvoke_hook
+            await ainvoke_hook(
+                "post_gateway_turn", event=event, source=source, result=agent_result,
+            )
+        except Exception as exc:
+            logger.warning("post_gateway_turn failed open: %s", exc)
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(

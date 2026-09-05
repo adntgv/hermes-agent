@@ -166,6 +166,7 @@ class SessionContext:
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
     shared_multi_user_session: bool = False
+    topic_context: str = ""
     session_key: str = ""
     session_id: str = ""
     created_at: Optional[datetime] = None
@@ -177,6 +178,7 @@ class SessionContext:
             "connected_platforms": [p.value for p in self.connected_platforms],
             "home_channels": {p.value: hc.to_dict() for p, hc in self.home_channels.items()},
             "shared_multi_user_session": self.shared_multi_user_session,
+            "topic_context": self.topic_context,
             "session_key": self.session_key, "session_id": self.session_id,
             "created_at": _iso(self.created_at), "updated_at": _iso(self.updated_at),
         }
@@ -401,6 +403,9 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
             "only. Do not assume unresolved references are about other Matrix rooms or projects "
             "unless the user explicitly says so."
         )
+
+    if context.topic_context:
+        lines.extend(("", context.topic_context))
 
     # Shared multi-user sessions: never pin one user name in the system prompt (changes per turn ->
     # busts the prompt cache); sender names are prefixed on each user message instead.
@@ -1186,6 +1191,20 @@ def build_session_context(
         source=source, connected_platforms=connected, shared_multi_user_session=shared,
         home_channels={p: home for p in connected if (home := config.get_home_channel(p))},
     )
+    try:
+        from hermes_cli.plugins import invoke_hook
+        for result in invoke_hook(
+            "enrich_gateway_session_context",
+            source=source, config=config, session_entry=session_entry,
+        ):
+            if isinstance(result, dict) and result.get("topic_context"):
+                context.topic_context = str(result["topic_context"])
+                break
+            if isinstance(result, str) and result.strip():
+                context.topic_context = result
+                break
+    except Exception:
+        logger.debug("Could not enrich gateway session context", exc_info=True)
     if session_entry:
         context.session_key = session_entry.session_key
         context.session_id = session_entry.session_id
