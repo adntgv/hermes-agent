@@ -5099,7 +5099,12 @@ class TelegramAdapter(BasePlatformAdapter):
     @staticmethod
     def _chat_type_str(chat) -> str:
         """PTB enum or plain-string ``chat.type`` → bare lowercase name (``supergroup``)."""
-        return str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        token = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
+        # MagicMock enum members include the useful token inside their repr.
+        for known in ("supergroup", "group", "channel", "private"):
+            if known in token:
+                return known
+        return token
 
     @staticmethod
     def _chat_id_str(message) -> str:
