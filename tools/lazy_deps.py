@@ -167,7 +167,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "httplib2==0.32.0",
         "pyasn1==0.6.4",
     ),
-    "skill.youtube": ("youtube-transcript-api==1.2.4",),
+    "skill.youtube": ("youtube-transcript-api==1.2.4", "yt-dlp==2026.3.17"),
 
     # ─── Tools ─────────────────────────────────────────────────────────────
     # ACP adapter (VS Code / Zed / JetBrains)

@@ -20,6 +20,7 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
     "text_to_speech",
+    "create_kazakh_youtube_subtitles",
     "todo_list", "memory",
     "session_search",
     "clarify",
@@ -120,6 +121,10 @@ TOOLSETS = {
         ["read_file", "write_file", "patch", "search_files"],
     ),
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
+    "media": _ts(
+        "Media processing tools: YouTube/audio subtitle generation and related workflows",
+        ["create_kazakh_youtube_subtitles"],
+    ),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
